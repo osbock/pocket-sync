@@ -114,7 +114,9 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
 @media (max-width: 800px) {
   .layout { grid-template-columns: 1fr; height: auto; }
   .listpane { max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--line); }
-  #search { width: 140px; } #queue { left: 16px; width: auto; }
+  header { flex-wrap: wrap; position: static; } #devUpdated { display: none; }
+  #search { width: 100%; order: 5; } #queue { left: 16px; width: auto; }
+  .detail { padding: 0 16px 120px; }
 }
 </style>
 </head>
@@ -153,8 +155,10 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
 
 <dialog id="delDlg">
   <h3 id="delTitle">Delete</h3>
+  <label><input type="checkbox" id="delAudio"> <span><b>Audio file only</b> (keep transcript and summary)<br>
+    <span class="note" id="delAudioNote">Audio moves to the Trash. The title, transcript, summary and speakers stay; playback and re-transcribing won't be possible.</span></span></label>
   <label><input type="checkbox" id="delMac"> <span><b>Mac copy and transcripts</b><br>
-    <span class="note">Moved to the Trash. Sync won't download it again.</span></span></label>
+    <span class="note">Everything for the recording moves to the Trash. Sync won't download it again.</span></span></label>
   <label><input type="checkbox" id="delDev"> <span><b>On the recorder</b><br>
     <span class="note" id="delDevNote">Deleted over Bluetooth by a queued job. This can't be undone.</span></span></label>
   <div class="btns"><button id="delCancel">Cancel</button><button id="delGo" class="primary" disabled>Delete</button></div>
@@ -212,6 +216,7 @@ function renderList() {
       r.summarized ? '<span class="b on">summary</span>' : '',
       r.on_device ? `<span class="b dev">${r.on_mac ? 'on recorder' : 'only on recorder'}</span>` : '',
       r.deleted_locally ? '<span class="b">deleted on Mac</span>' : '',
+      r.on_mac && r.has_audio === false ? '<span class="b">audio deleted</span>' : '',
       ...q.map(k => `<span class="b queued">${k === 'delete_device' ? 'deleting' : k + ' queued'}</span>`),
     ].join('');
     html += `<div class="row ${state.active === r.id ? 'active' : ''}" data-id="${esc(r.id)}">
@@ -270,22 +275,37 @@ function openDelete(ids) {
   delIds = ids;
   const recs = state.recs.filter(r => ids.includes(r.id));
   const anyDev = recs.some(r => r.on_device), anyMac = recs.some(r => r.on_mac);
+  const audioOk = recs.filter(r => r.has_audio && r.transcribed).length;
   $('#delTitle').textContent = ids.length === 1 ? `Delete “${recs[0]?.title || whenOf(recs[0]).time}”?` : `Delete ${ids.length} recordings?`;
-  $('#delMac').checked = false; $('#delDev').checked = false;
-  $('#delMac').disabled = !anyMac; $('#delDev').disabled = !anyDev;
+  $('#delMac').checked = false; $('#delDev').checked = false; $('#delAudio').checked = false;
+  $('#delMac').disabled = !anyMac; $('#delDev').disabled = !anyDev; $('#delAudio').disabled = !audioOk;
+  $('#delAudioNote').textContent = !audioOk
+    ? (recs.some(r => r.has_audio) ? 'Only for recordings that have a transcript.' : 'The audio file is already deleted.')
+    : 'Audio moves to the Trash. The title, transcript, summary and speakers stay; playback and re-transcribing won’t be possible.'
+      + (audioOk < recs.length ? ` Applies to ${audioOk} of ${recs.length} (the others have no transcript or no audio).` : '');
   $('#delDevNote').textContent = anyDev ? 'Deleted over Bluetooth by a queued job. This can’t be undone.'
     : 'Not on the recorder as of the last sync.';
   $('#delGo').disabled = true; $('#delDlg').showModal();
 }
-for (const id of ['#delMac', '#delDev']) $(id).onchange = () => $('#delGo').disabled = !($('#delMac').checked || $('#delDev').checked);
+for (const id of ['#delMac', '#delDev', '#delAudio']) $(id).onchange = e => {
+  // "Audio only" and "Mac copy and transcripts" are alternatives.
+  if (e.target.id === 'delMac' && e.target.checked) $('#delAudio').checked = false;
+  if (e.target.id === 'delAudio' && e.target.checked) $('#delMac').checked = false;
+  $('#delGo').disabled = !($('#delMac').checked || $('#delDev').checked || $('#delAudio').checked);
+};
 $('#delCancel').onclick = () => $('#delDlg').close();
 $('#delGo').onclick = async () => {
-  const body = { ids: delIds, mac: $('#delMac').checked, device: $('#delDev').checked };
+  const body = { ids: delIds, mac: $('#delMac').checked, device: $('#delDev').checked, audio_only: $('#delAudio').checked };
   $('#delDlg').close();
   try {
     const r = await api('/api/delete', { method: 'POST', body });
-    toast([r.trashed ? `${r.trashed} moved to the Trash` : '', r.job ? 'recorder deletion queued' : ''].filter(Boolean).join('; ') || 'Nothing deleted');
-    if (body.mac && delIds.includes(state.active)) { audio.pause(); state.active = null; $('#detail').innerHTML = '<div class="empty">Select a recording.</div>'; }
+    toast([r.trashed ? `${r.trashed} moved to the Trash` : '',
+           r.audio_removed ? `audio of ${r.audio_removed} moved to the Trash` : '',
+           r.skipped?.length ? `${r.skipped.length} skipped (no transcript)` : '',
+           r.job ? 'recorder deletion queued' : ''].filter(Boolean).join('; ') || 'Nothing deleted');
+    if ((body.mac || body.audio_only) && delIds.includes(state.active)) { audio.pause(); audio.removeAttribute('src'); audio.dataset.id = ''; }
+    if (body.mac && delIds.includes(state.active)) { state.active = null; $('#detail').innerHTML = '<div class="empty">Select a recording.</div>'; }
+    else if (body.audio_only && delIds.includes(state.active)) openRec(state.active);
     for (const id of delIds) state.selected.delete(id);
     await loadJobs(); await loadList();
   } catch (e) { toast(e.message); }
@@ -303,6 +323,10 @@ async function openRec(id) {
   }
   const d = await api(`/api/recordings/${id}`);
   state.detail = d; state.peaks = null;
+  if (!d.has_audio) {  // transcript-only: the audio file was deleted to save space
+    audio.pause(); audio.removeAttribute('src'); audio.dataset.id = '';
+    renderDetail(); return;
+  }
   const keepTime = audio.dataset.id === id ? audio.currentTime : 0;
   if (audio.dataset.id !== id) { audio.pause(); audio.src = `/audio/${id}.mp3`; audio.dataset.id = id; }
   renderDetail();
@@ -318,10 +342,11 @@ function renderDetail() {
       ${d.on_device ? '<span class="b dev">on recorder</span>' : ''}
       ${q.map(k => `<span class="b queued">${k} queued</span>`).join('')}
       <span class="grow"></span><button class="danger" id="delOne">Delete…</button></div>
-    <div class="player"><canvas id="wave"></canvas>
+    ${d.has_audio ? `<div class="player"><canvas id="wave"></canvas>
       <div class="ctl"><button id="playBtn" class="primary">Play</button><button id="back10">−10s</button><button id="fwd10">+10s</button>
         <select id="rate"><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
-        <span class="time" id="timeLbl">0:00 / ${fmt(d.seconds)}</span></div></div>
+        <span class="time" id="timeLbl">0:00 / ${fmt(d.seconds)}</span></div></div>`
+      : `<div class="player note">The audio file was deleted to save space; the transcript, summary and speakers are kept.${d.on_device ? ' It is still on the recorder: Sync will not download it again, but you can find it there.' : ''}</div>`}
     <div class="tabs">
       <button data-tab="transcript">Transcript</button><button data-tab="summary">Summary</button>
       <button data-tab="speakers">Speakers${d.speaker_details.length ? ' (' + d.speaker_details.length + ')' : ''}</button></div></div>
@@ -333,19 +358,25 @@ function renderDetail() {
     catch (err) { toast(err.message); }
   });
   $('#delOne').onclick = () => openDelete([d.id]);
-  $('#playBtn').onclick = () => audio.paused ? audio.play() : audio.pause();
-  $('#back10').onclick = () => audio.currentTime = Math.max(0, audio.currentTime - 10);
-  $('#fwd10').onclick = () => audio.currentTime = audio.currentTime + 10;
-  $('#rate').value = String(audio.playbackRate); $('#rate').onchange = e => audio.playbackRate = +e.target.value;
-  $('#wave').onclick = e => { const r = e.target.getBoundingClientRect(); seek((e.clientX - r.left) / r.width * (audio.duration || d.seconds)); };
   document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; renderTab(); });
+  if (d.has_audio) {
+    $('#playBtn').onclick = () => audio.paused ? audio.play() : audio.pause();
+    $('#back10').onclick = () => audio.currentTime = Math.max(0, audio.currentTime - 10);
+    $('#fwd10').onclick = () => audio.currentTime = audio.currentTime + 10;
+    $('#rate').value = String(audio.playbackRate); $('#rate').onchange = e => audio.playbackRate = +e.target.value;
+    $('#wave').onclick = e => { const r = e.target.getBoundingClientRect(); seek((e.clientX - r.left) / r.width * (audio.duration || d.seconds)); };
+  }
   renderTab(); drawWave(); syncPlayer();
 }
-function seek(t, stopAt) { audio.currentTime = t; audio.dataset.stopAt = stopAt ?? ''; audio.play(); }
+function seek(t, stopAt) {
+  if (!state.detail?.has_audio) return;
+  audio.currentTime = t; audio.dataset.stopAt = stopAt ?? ''; audio.play();
+}
 function renderTab() {
   const d = state.detail, body = $('#tabBody');
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === state.tab));
   if (state.tab === 'transcript') {
+    if (!d.segments.length && !d.has_audio) { body.innerHTML = '<div class="note">No transcript, and the audio file was deleted.</div>'; return; }
     if (!d.segments.length) { body.innerHTML = `<div class="cta"><span class="note">No transcript yet.</span><button id="ctaT">Transcribe</button></div>`;
       $('#ctaT').onclick = () => enqueue('transcribe', [d.id]); return; }
     let prev = null;
@@ -369,7 +400,7 @@ function renderTab() {
         <span class="grow" style="flex:1"></span>
         <input type="text" list="voiceList" placeholder="Name" value="${esc(s.name || '')}" data-name="${i}" style="width:150px">
         <button data-save="${i}">Save</button></div>
-        ${s.clips.map(c => `<div class="clip"><button data-clip="${c.start},${c.end}" title="Play clip">▶</button><span>${fmt(c.start)}</span><span>${esc(c.text)}</span></div>`).join('')}
+        ${s.clips.map(c => `<div class="clip">${d.has_audio ? `<button data-clip="${c.start},${c.end}" title="Play clip">▶</button>` : '<span></span>'}<span>${fmt(c.start)}</span><span>${esc(c.text)}</span></div>`).join('')}
       </div>`).join('');
     body.onclick = async e => {
       const c = e.target.closest('[data-clip]');

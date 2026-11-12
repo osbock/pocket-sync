@@ -340,10 +340,14 @@ def suggest_title(mp3: Path, summary: Path, model: str) -> str | None:
 # ── commands ────────────────────────────────────────────────────────
 
 def find_recording(ref: str, rec_dir: Path) -> Path:
+    """The recording's .mp3 path. The audio may have been deleted to save
+    space; its transcript files (<name>.json) are enough for naming speakers."""
     p = Path(ref).expanduser()
-    if p.suffix == ".mp3" and p.exists():
+    if p.suffix == ".mp3" and (p.exists() or p.with_suffix(".json").exists()):
         return p
-    hits = sorted(rec_dir.glob(f"*/{Path(ref).stem.split('.')[0]}.mp3"))
+    stem = Path(ref).stem.split('.')[0]
+    hits = sorted(rec_dir.glob(f"*/{stem}.mp3")) or \
+        sorted(j.with_suffix(".mp3") for j in rec_dir.glob(f"*/{stem}.json"))
     if not hits:
         sys.exit(f"No recording named {ref} under {rec_dir}")
     return hits[0]
@@ -351,9 +355,13 @@ def find_recording(ref: str, rec_dir: Path) -> Path:
 
 def process(mp3: Path, args, voices: dict, model: str | None) -> None:
     p = paths(mp3)
-    print(f"{mp3.parent.name}/{mp3.name} (~{mp3.stat().st_size / 4000 / 60:.1f} min)", flush=True)
+    length = f"~{mp3.stat().st_size / 4000 / 60:.1f} min" if mp3.exists() else "audio deleted"
+    print(f"{mp3.parent.name}/{mp3.name} ({length})", flush=True)
     if args.summary_only and p["txt"].exists() and p["json"].exists():
         return summarize_step(mp3, p["txt"], args, model)
+    if not mp3.exists():
+        print("    skipped: the audio file was deleted, so it can't be transcribed", flush=True)
+        return
     audio = load_audio(mp3)
     secs = len(audio) / SR
 
@@ -523,9 +531,11 @@ def main():
     if not args.force:
         done = ".summary.md" if args.summary_only else ".txt"
         files = [f for f in files if not f.with_suffix(done).exists()]
-    files = [f for f in files if f.stat().st_size >= args.min_seconds * 4000]
+    size = lambda f: f.stat().st_size if f.exists() else 0  # noqa: E731
+    files = [f for f in files if size(f) >= args.min_seconds * 4000
+             or (args.summary_only and f.with_suffix(".txt").exists())]
     if args.largest and files:
-        files = [max(files, key=lambda f: f.stat().st_size)]
+        files = [max(files, key=size)]
     if not files:
         print("Nothing to transcribe.")
         return

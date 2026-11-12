@@ -131,9 +131,17 @@ POCKET_APP_PORT=9000 uv run app.py     # another port
 - **Sync:** pick Bluetooth or USB cable. For USB, a banner tells you when to
   plug in and when to unplug.
 - **Delete…:** asks each time what to delete:
-  - *Mac copy and transcripts*: moved to the Trash, and remembered so sync
-    won't download it again.
+  - *Audio file only (keep transcript and summary)*: the MP3 goes to the
+    Trash. The recording stays in the list with its title, transcript,
+    summary and speakers, marked *audio deleted*. Playback and
+    re-transcribing are no longer possible. Summarizing again and naming
+    speakers still work. Only offered for recordings that have a transcript.
+  - *Mac copy and transcripts*: everything goes to the Trash.
   - *On the recorder*: queued as a Bluetooth job. Permanent.
+
+  Mac deletions are remembered, so sync won't download the audio again.
+  To free space **on the recorder** while keeping everything on the Mac,
+  tick only *On the recorder*. For scale, an hour of audio is about 14 MB.
 - **Queue:** select recordings and choose Transcribe or Summarize
   (summarizing transcribes first if needed). Jobs survive restarts; you can
   reorder or cancel them. Two lanes run side by side: *gpu* (one transcription
@@ -246,7 +254,7 @@ update them, so one wrong match can't gradually corrupt a voice.
     20261105150712.json           Whisper segments with speaker labels
     20261105150712.speakers.json  speaker turns and voiceprints
     20261105150712.summary.md     summary
-    20261105150712.meta.json      title
+    20261105150712.meta.json      title (and length, once the audio is deleted)
     20261105150712.peaks.json     waveform cache for the app
   .pocket-sync.json               download log (also marks deliberate deletions)
   .device.json                    what was on the recorder at the last sync

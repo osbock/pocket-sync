@@ -102,15 +102,20 @@ def app_cfg() -> dict:
 # ── recordings ─────────────────────────────────────────────────────
 
 def summarize_rec(mp3: Path, device: set[str], manifest: dict) -> dict:
+    """A recording on this Mac: with its audio, or transcript-only after the
+    audio file was deleted to save space."""
     rec_id = f"{mp3.parent.name}/{mp3.stem}"
-    size = mp3.stat().st_size
+    has_audio = mp3.exists()
     meta = read_json(side(mp3, ".meta.json"), {})
+    size = mp3.stat().st_size if has_audio else None
+    seconds = round(size / BYTES_PER_SECOND, 1) if has_audio else meta.get("audio_seconds")
     spk = read_json(side(mp3, ".speakers.json"), None)
     names = sorted({s.get("name") or lab for lab, s in real_speakers(spk).items()})
     return {
         "id": rec_id, "date": mp3.parent.name, "name": mp3.stem,
         "title": meta.get("title"), "title_source": meta.get("title_source"),
-        "seconds": round(size / BYTES_PER_SECOND, 1), "bytes": size,
+        "seconds": seconds, "bytes": size,
+        "has_audio": has_audio,
         "transcribed": side(mp3, ".txt").exists(),
         "speakers_done": spk is not None,
         "summarized": side(mp3, ".summary.md").exists(),
@@ -120,12 +125,22 @@ def summarize_rec(mp3: Path, device: set[str], manifest: dict) -> dict:
     }
 
 
+def local_recordings() -> list[Path]:
+    """mp3 paths (existing or not) for every recording kept on this Mac,
+    including transcript-only ones whose audio was deleted."""
+    found = {m for m in REC_DIR.glob("*/*.mp3")}
+    for j in REC_DIR.glob("*/*.json"):
+        if j.name.count(".") == 1:  # <name>.json segments, not .speakers.json etc.
+            found.add(j.with_suffix(".mp3"))
+    return sorted(found)
+
+
 @app.get("/api/recordings")
 def list_recordings(q: str = "", short: bool = False):
     dev = read_json(REC_DIR / ".device.json", {})
     device = set(dev.get("recordings", []))
     manifest = read_json(REC_DIR / ".pocket-sync.json", {})
-    recs = [summarize_rec(m, device, manifest) for m in REC_DIR.glob("*/*.mp3")]
+    recs = [summarize_rec(m, device, manifest) for m in local_recordings()]
     on_mac = {f"{r['id']}.mp3" for r in recs}
     for rel in device - on_mac:  # on the recorder but not downloaded
         date, name = rel.removesuffix(".mp3").split("/")
@@ -156,7 +171,7 @@ def list_recordings(q: str = "", short: bool = False):
 def get_recording(date: str, name: str):
     rec_id = f"{date}/{name}"
     mp3 = mp3_for(rec_id)
-    if not mp3.exists():
+    if not mp3.exists() and not side(mp3, ".json").exists():
         raise HTTPException(404, "not on this Mac")
     dev = set(read_json(REC_DIR / ".device.json", {}).get("recordings", []))
     info = summarize_rec(mp3, dev, {})
@@ -275,14 +290,28 @@ def delete(body: dict = Body(...)):
     ids = body.get("ids") or []
     for rec_id in ids:
         mp3_for(rec_id)
-    trashed = 0
-    if body.get("mac"):
+    trashed = audio_removed = 0
+    skipped = []
+    if body.get("mac") or body.get("audio_only"):
         manifest_file = REC_DIR / ".pocket-sync.json"
         manifest = read_json(manifest_file, {})
         stamp = time.strftime("%Y%m%d-%H%M%S")
         for rec_id in ids:
             mp3 = mp3_for(rec_id)
-            files = [f for f in [mp3, *(side(mp3, e) for e in SIDECARS)] if f.exists()]
+            if body.get("mac"):
+                files = [f for f in [mp3, *(side(mp3, e) for e in SIDECARS)] if f.exists()]
+            else:
+                # Audio only: keep transcript, summary, speakers and title.
+                if not side(mp3, ".json").exists():
+                    skipped.append(rec_id)  # no transcript: would lose everything
+                    continue
+                files = [f for f in (mp3, side(mp3, ".peaks.json")) if f.exists()]
+                if mp3.exists():
+                    meta_file = side(mp3, ".meta.json")
+                    meta = read_json(meta_file, {})
+                    meta.update(audio_seconds=round(mp3.stat().st_size / BYTES_PER_SECOND, 1),
+                                audio_removed=time.strftime("%Y-%m-%dT%H:%M:%S"))
+                    write_json(meta_file, meta)
             if not files:
                 continue
             dest = Path.home() / ".Trash" / f"Pocket {rec_id.replace('/', ' ')} {stamp}"
@@ -291,12 +320,15 @@ def delete(body: dict = Body(...)):
                 shutil.move(str(f), dest / f.name)
             # Remember it was deleted on purpose so sync doesn't download it again.
             manifest.setdefault(f"{rec_id}.mp3", {})["deleted_locally"] = True
-            trashed += 1
+            if body.get("mac"):
+                trashed += 1
+            else:
+                audio_removed += 1
         write_json(manifest_file, manifest)
     job = None
     if body.get("device") and ids:
         job = queue.add("delete_device", ids)
-    return {"trashed": trashed, "job": job}
+    return {"trashed": trashed, "audio_removed": audio_removed, "skipped": skipped, "job": job}
 
 
 # ── LM Studio ──────────────────────────────────────────────────────
@@ -467,9 +499,10 @@ def estimate(kind: str, recs: list[str], options: dict) -> float | None:
     secs = 0.0
     for rec_id in recs:
         mp3 = REC_DIR / f"{rec_id}.mp3"
-        if not mp3.exists():
-            continue
-        dur = mp3.stat().st_size / BYTES_PER_SECOND
+        if mp3.exists():
+            dur = mp3.stat().st_size / BYTES_PER_SECOND
+        else:
+            dur = read_json(side(mp3, ".meta.json"), {}).get("audio_seconds") or 0
         transcribed = side(mp3, ".txt").exists()
         if kind == "transcribe" or (kind == "summarize" and not transcribed):
             secs += 15 + dur / 40 + dur / 25          # whisper + speakers + model load
@@ -560,8 +593,9 @@ def add_jobs(body: dict = Body(...)):
         return {"jobs": [queue.add(kind, [])]}
     added = []
     for rec_id in ids:
-        if not mp3_for(rec_id).exists():
-            continue
+        mp3 = mp3_for(rec_id)
+        if not mp3.exists() and not (kind == "summarize" and side(mp3, ".txt").exists()):
+            continue  # transcribing needs the audio; summarizing only the transcript
         if any(j["kind"] == kind and rec_id in j["recs"] and j["status"] in ("pending", "running")
                for j in queue.jobs):
             continue  # already queued
