@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+# Recordings and personal data live outside this folder (~/PocketRecordings,
+# ~/.config/pocket-sync); never copy them in here.
+*.mp3
+*.part
+.claude/
