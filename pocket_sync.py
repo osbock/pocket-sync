@@ -291,10 +291,13 @@ def manifest_path(out: Path) -> Path:
 
 
 def load_manifest(out: Path) -> dict:
+    """Keys are DATE/NAME.mp3 with forward slashes on every platform (early
+    Windows runs wrote backslashes; those are converted)."""
     try:
-        return json.loads(manifest_path(out).read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path(out).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
+    return {k.replace("\\", "/"): v for k, v in manifest.items()}
 
 
 def save_manifest(out: Path, manifest: dict) -> None:
@@ -380,10 +383,10 @@ async def cmd_list(cfg, args):
         recs = await p.list_all()
     finally:
         await p.__aexit__(None, None, None)
-    save_device_index(out, [str(r.rel_path) for r in recs])
+    save_device_index(out, [r.rel_path.as_posix() for r in recs])
     total = 0
     for r in recs:
-        entry = manifest.get(str(r.rel_path), {})
+        entry = manifest.get(r.rel_path.as_posix(), {})
         mark = "x" if entry.get("deleted_locally") else "✓" if entry else " "
         print(f"{mark} {r.date}  {r.name}  {fmt_dur(r.duration_s)}")
         total += r.duration_s
@@ -400,10 +403,10 @@ async def cmd_pull(cfg, args):
     p = await connected(cfg)
     try:
         recs = await p.list_all()
-        save_device_index(out, [str(r.rel_path) for r in recs])
+        save_device_index(out, [r.rel_path.as_posix() for r in recs])
         todo = [r for r in recs
-                if not manifest.get(str(r.rel_path), {}).get("deleted_locally")
-                and (str(r.rel_path) not in manifest or not (out / r.rel_path).exists())]
+                if not manifest.get(r.rel_path.as_posix(), {}).get("deleted_locally")
+                and (r.rel_path.as_posix() not in manifest or not (out / r.rel_path).exists())]
         if args.since:
             todo = [r for r in todo if r.date >= args.since]
         if args.limit:
@@ -442,7 +445,7 @@ async def cmd_pull(cfg, args):
             tmp = dest.with_suffix(".part")
             tmp.write_bytes(data)
             tmp.replace(dest)
-            manifest[str(r.rel_path)] = {"bytes": len(data), "duration_s": r.duration_s,
+            manifest[r.rel_path.as_posix()] = {"bytes": len(data), "duration_s": r.duration_s,
                                          "downloaded": time.strftime("%Y-%m-%dT%H:%M:%S")}
             save_manifest(out, manifest)
             print(f"\r{label}  done, {len(data):,} bytes in {time.monotonic() - start:.0f}s      ")
@@ -477,7 +480,7 @@ async def cmd_delete(cfg, args):
         recs = await p.list_all()
     finally:
         await p.__aexit__(None, None, None)
-    save_device_index(out, [str(r.rel_path) for r in recs])
+    save_device_index(out, [r.rel_path.as_posix() for r in recs])
     if failed:
         sys.exit(f"{failed} recording(s) could not be deleted.")
 
@@ -551,11 +554,11 @@ async def cmd_pull_usb(cfg, args):
             date, name = f.parent.name, f.stem
             if SAFE.match(date) and SAFE.match(name) and not name.startswith("."):
                 found.append((f, Path(date) / f.name))
-        save_device_index(out, [str(rel) for _, rel in found])
+        save_device_index(out, [rel.as_posix() for _, rel in found])
         if args.since:
             found = [(f, rel) for f, rel in found if rel.parts[0] >= args.since]
         todo = [(f, rel) for f, rel in found
-                if not manifest.get(str(rel), {}).get("deleted_locally")
+                if not manifest.get(rel.as_posix(), {}).get("deleted_locally")
                 and (not (out / rel).exists() or (out / rel).stat().st_size != f.stat().st_size)]
         if args.limit:
             todo = todo[-args.limit:]
@@ -576,7 +579,7 @@ async def cmd_pull_usb(cfg, args):
                     print(f"  {rel}: size mismatch, skipped")
                     continue
                 tmp.replace(dest)
-                manifest[str(rel)] = {"bytes": size, "duration_s": size // BYTES_PER_SECOND,
+                manifest[rel.as_posix()] = {"bytes": size, "duration_s": size // BYTES_PER_SECOND,
                                       "downloaded": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                       "via": "usb"}
                 save_manifest(out, manifest)

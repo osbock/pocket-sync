@@ -108,7 +108,8 @@ on real hardware.
 
 Checked:
 
-- Bluetooth: `scan`, `info`, `list` (bleak WinRT; no pairing, no prompt).
+- Bluetooth: `scan`, `info`, `list`, and a sync from the web app (bleak WinRT;
+  no pairing, no prompt).
 - `pull --usb`: found as a removable exFAT drive (label "Pocket", USB ID
   ZEPHYR USB DISK), 12 recordings / 24.6 MB in 22 s, eject via
   `DeviceIoControl` keeps it gone. **Order matters:** cable unplugged, USB mode
@@ -131,7 +132,7 @@ Checked:
 
 Not yet checked:
 
-- `pull` over Bluetooth (downloads); a full `pull --usb` run after the retry fix.
+- A full `pull --usb` run after the retry fix.
 - A side-by-side diff with the Mac's transcript of the same recording.
 - Keep-awake during a long job (`powercfg /requests` as admin shows it).
 - The web app's `lms.exe` load/unload of the summary model.
@@ -142,3 +143,6 @@ Not yet checked:
 Found while testing: `uv run app.py --help` started the server instead of
 printing help, which hung `install.sh` and `install.ps1` at the packages
 step; fixed for both.
+`pocket_sync.py` wrote `.device.json` and `.pocket-sync.json` paths with
+backslashes on Windows, which crashed the app's recording list; paths are now
+always `DATE/NAME.mp3`, and old backslash entries are converted when read.

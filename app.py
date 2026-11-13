@@ -101,6 +101,19 @@ def real_speakers(spk: dict | None) -> dict:
             if s.get("seconds", 0) >= MIN_SPEAKER_SECONDS or (s.get("manual") and s["seconds"] > 0)}
 
 
+def device_index() -> dict:
+    """.device.json, with paths as DATE/NAME.mp3 (early Windows runs of
+    pocket_sync.py wrote backslashes)."""
+    dev = read_json(REC_DIR / ".device.json", {})
+    dev["recordings"] = [r.replace("\\", "/") for r in dev.get("recordings", [])]
+    return dev
+
+
+def manifest() -> dict:
+    return {k.replace("\\", "/"): v
+            for k, v in read_json(REC_DIR / ".pocket-sync.json", {}).items()}
+
+
 def app_cfg() -> dict:
     return read_json(APP_CFG, {})
 
@@ -143,14 +156,14 @@ def local_recordings() -> list[Path]:
 
 @app.get("/api/recordings")
 def list_recordings(q: str = "", short: bool = False):
-    dev = read_json(REC_DIR / ".device.json", {})
-    device = set(dev.get("recordings", []))
-    manifest = read_json(REC_DIR / ".pocket-sync.json", {})
-    recs = [summarize_rec(m, device, manifest) for m in local_recordings()]
+    dev = device_index()
+    device = set(dev["recordings"])
+    man = manifest()
+    recs = [summarize_rec(m, device, man) for m in local_recordings()]
     on_mac = {f"{r['id']}.mp3" for r in recs}
     for rel in device - on_mac:  # on the recorder but not downloaded
         date, name = rel.removesuffix(".mp3").split("/")
-        entry = manifest.get(rel, {})
+        entry = man.get(rel, {})
         recs.append({"id": f"{date}/{name}", "date": date, "name": name, "title": None,
                      "seconds": None, "on_mac": False, "on_device": True,
                      "deleted_locally": bool(entry.get("deleted_locally")),
@@ -179,7 +192,7 @@ def get_recording(date: str, name: str):
     mp3 = mp3_for(rec_id)
     if not mp3.exists() and not side(mp3, ".json").exists():
         raise HTTPException(404, "not on this Mac")
-    dev = set(read_json(REC_DIR / ".device.json", {}).get("recordings", []))
+    dev = set(device_index()["recordings"])
     info = summarize_rec(mp3, dev, {})
     data = read_json(side(mp3, ".json"), {})
     spk = read_json(side(mp3, ".speakers.json"), None)
@@ -309,7 +322,7 @@ def delete(body: dict = Body(...)):
     skipped = []
     if body.get("mac") or body.get("audio_only"):
         manifest_file = REC_DIR / ".pocket-sync.json"
-        manifest = read_json(manifest_file, {})
+        man = manifest()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         for rec_id in ids:
             mp3 = mp3_for(rec_id)
@@ -331,12 +344,12 @@ def delete(body: dict = Body(...)):
                 continue
             trash(files, f"Pocket {rec_id.replace('/', ' ')} {stamp}")
             # Remember it was deleted on purpose so sync doesn't download it again.
-            manifest.setdefault(f"{rec_id}.mp3", {})["deleted_locally"] = True
+            man.setdefault(f"{rec_id}.mp3", {})["deleted_locally"] = True
             if body.get("mac"):
                 trashed += 1
             else:
                 audio_removed += 1
-        write_json(manifest_file, manifest)
+        write_json(manifest_file, man)
     job = None
     if body.get("device") and ids:
         job = queue.add("delete_device", ids)
