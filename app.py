@@ -26,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import tomllib
 import time
 import urllib.request
 import uuid
@@ -41,6 +42,7 @@ REC_DIR = Path(os.environ.get("POCKET_RECORDINGS") or Path.home() / "PocketRecor
 QUEUE_FILE = REC_DIR / ".queue.json"
 VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
 APP_CFG = Path.home() / ".config" / "pocket-sync" / "app.json"
+PROJECTS = Path.home() / ".config" / "pocket-sync" / "projects.toml"
 LMS = Path.home() / ".lmstudio" / "bin" / "lms"
 LMSTUDIO = "http://localhost:1234"
 UV = shutil.which("uv") or "/opt/homebrew/bin/uv"
@@ -51,6 +53,7 @@ SIDECARS = [".txt", ".srt", ".json", ".speakers.json", ".summary.md", ".summary-
             ".meta.json", ".peaks.json"]
 
 app = FastAPI(title="Pocket Recordings")
+META_LOCK = threading.Lock()  # read-modify-write of <name>.meta.json
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -239,14 +242,15 @@ def audio(date: str, name: str):
 def set_title(date: str, name: str, body: dict = Body(...)):
     mp3 = mp3_for(f"{date}/{name}")
     meta_file = side(mp3, ".meta.json")
-    meta = read_json(meta_file, {})
     title = (body.get("title") or "").strip()[:200]
-    if title:
-        meta.update(title=title, title_source="user")
-    else:
-        meta.pop("title", None)
-        meta.pop("title_source", None)
-    write_json(meta_file, meta)
+    with META_LOCK:
+        meta = read_json(meta_file, {})
+        if title:
+            meta.update(title=title, title_source="user")
+        else:
+            meta.pop("title", None)
+            meta.pop("title_source", None)
+        write_json(meta_file, meta)
     return {"title": meta.get("title")}
 
 
@@ -395,7 +399,8 @@ def ensure_model_loaded(model: str, job: dict) -> None:
 # ── job queue ──────────────────────────────────────────────────────
 
 LANES = {"transcribe": "gpu", "summarize": "gpu",
-         "sync_ble": "device", "sync_usb": "device", "delete_device": "device"}
+         "sync_ble": "device", "sync_usb": "device", "delete_device": "device",
+         "inbox": "inbox"}
 NOISE = re.compile(r"warn|Warning|^\s*$|torchaudio|UserWarning|deprecat|^\s+\w+\(|Installed \d+ packages")
 
 
@@ -532,6 +537,8 @@ def estimate(kind: str, recs: list[str], options: dict) -> float | None:
 
 def run_job(q: Queue, job: dict) -> None:
     kind, recs = job["kind"], job["recs"]
+    if kind == "inbox":
+        return run_inbox(q, job)
     if kind == "transcribe":
         cmd = ["transcribe.py", "--force", *[str(REC_DIR / f"{r}.mp3") for r in recs]]
     elif kind == "summarize":
@@ -580,17 +587,18 @@ def run_job(q: Queue, job: dict) -> None:
 queue = Queue()
 
 
+def job_view(j: dict, full_log: bool = False) -> dict:
+    x = {k: v for k, v in j.items() if k != "log"}
+    x["log" if full_log else "log_tail"] = j["log"] if full_log else j["log"][-8:]
+    if j["status"] == "running" and j["started"]:
+        x["elapsed"] = round(time.time() - j["started"])
+    return x
+
+
 @app.get("/api/jobs")
 def jobs():
     with queue.lock:
-        now = time.time()
-        out = []
-        for j in queue.jobs:
-            x = {k: v for k, v in j.items() if k != "log"}
-            x["log_tail"] = j["log"][-8:]
-            if j["status"] == "running" and j["started"]:
-                x["elapsed"] = round(now - j["started"])
-            out.append(x)
+        out = [job_view(j) for j in queue.jobs]
     pending = [j for j in out if j["status"] in ("pending", "running")]
     gpu_left = sum(max((j.get("estimate") or 0) - j.get("elapsed", 0), 0)
                    for j in pending if j["lane"] == "gpu")
@@ -609,16 +617,41 @@ def add_jobs(body: dict = Body(...)):
                for j in queue.jobs):
             raise HTTPException(409, "A sync is already queued")
         return {"jobs": [queue.add(kind, [])]}
-    added = []
+    return {"jobs": queue_recs(kind, ids, options)[0]}
+
+
+def active(j: dict) -> bool:
+    return j["status"] in ("pending", "running")
+
+
+def queue_recs(kind: str, ids: list[str], options: dict) -> tuple[list[dict], list[dict]]:
+    """Queue one job per recording; returns (added, already queued)."""
+    added, existing = [], []
     for rec_id in ids:
         mp3 = mp3_for(rec_id)
         if not mp3.exists() and not (kind == "summarize" and side(mp3, ".txt").exists()):
             continue  # transcribing needs the audio; summarizing only the transcript
-        if any(j["kind"] == kind and rec_id in j["recs"] and j["status"] in ("pending", "running")
-               for j in queue.jobs):
-            continue  # already queued
-        added.append(queue.add(kind, [rec_id], options))
-    return {"jobs": added}
+        with queue.lock:
+            same = next((j for j in queue.jobs
+                         if j["kind"] == kind and rec_id in j["recs"] and active(j)), None)
+        if same:
+            existing.append(same)
+        else:
+            added.append(queue.add(kind, [rec_id], options))
+    return added, existing
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, wait: int = 0):
+    """One job with its full log. ?wait=N waits up to N seconds (max 300) for
+    it to finish, so a script can poll without busy-looping."""
+    end = time.time() + min(max(wait, 0), 300)
+    while True:
+        with queue.lock:
+            j = queue.find(job_id)
+            if not active(j) or time.time() >= end:
+                return job_view(j, full_log=True)
+        time.sleep(1)
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -663,6 +696,167 @@ def shutdown():
     return {"ok": True}
 
 
+# ── inbox (used by the /pocket-inbox Claude skill) ─────────────────
+# An "inbox" job downloads new recordings, transcribes and summarizes them by
+# queueing ordinary jobs and waiting for each step. Which recordings have been
+# reviewed for spoken instructions, and the issues filed from them, are kept
+# under "inbox" in each <name>.meta.json.
+
+def inbox_pending() -> list[dict]:
+    out = []
+    for r in list_recordings()["recordings"]:
+        if not (r.get("on_mac") and r.get("transcribed")):
+            continue
+        base = REC_DIR / r["id"]
+        if "inbox" in read_json(base.with_suffix(".meta.json"), {}):
+            continue
+        summary = base.with_suffix(".summary.md")
+        out.append({"id": r["id"], "title": r.get("title"), "seconds": r.get("seconds"),
+                    "speakers": r.get("speakers", []),
+                    "transcript": str(base.with_suffix(".txt")),
+                    "summary": str(summary) if summary.exists() else None})
+    return sorted(out, key=lambda e: e["id"])
+
+
+def run_inbox(q: Queue, job: dict) -> None:
+    opts = job["options"]
+
+    def note(msg: str) -> None:
+        job["progress"] = msg
+        job["log"] = (job["log"] + [msg])[-60:]
+
+    def wait_for(children: list[dict], label: str) -> list[dict] | None:
+        """Wait for child jobs; None if this job was cancelled or the app is quitting."""
+        ids = {c["id"] for c in children}
+        while True:
+            if q.stopping:
+                return None
+            with q.lock:
+                kids = [j for j in q.jobs if j["id"] in ids]
+            if job.get("cancel"):
+                for k in kids:
+                    q.cancel(k["id"])
+                return None
+            left = [k for k in kids if active(k)]
+            if not left:
+                for k in kids:
+                    if k["status"] != "done":
+                        note(f"{k['kind']} {', '.join(k['recs'])}: {k['status']} "
+                             f"{k.get('error') or k.get('progress') or ''}".strip())
+                return kids
+            cur = next((k for k in left if k["status"] == "running"), left[0])
+            job["progress"] = f"{label}: {len(kids) - len(left)}/{len(kids)} done" + \
+                (f" - {cur['progress'][:80]}" if cur.get("progress") else "")
+            time.sleep(2)
+
+    if opts.get("sync", "ble") != "none":
+        kind = "sync_usb" if opts.get("sync") == "usb" else "sync_ble"
+        note(f"Downloading new recordings ({'USB' if kind == 'sync_usb' else 'Bluetooth'})")
+        with q.lock:
+            sync = next((j for j in q.jobs if j["kind"].startswith("sync") and active(j)), None)
+        sync = sync or q.add(kind, [])
+        done = wait_for([sync], "Sync")
+        if done is None:
+            return
+        if done and done[0]["status"] != "done":
+            note("Continuing with the recordings already on this Mac")
+
+    recs = list_recordings()["recordings"]
+    to_tx = [r["id"] for r in recs if r.get("on_mac") and r.get("has_audio")
+             and not r["transcribed"]]
+    if to_tx:
+        note(f"Transcribing {len(to_tx)} recording(s)")
+        added, existing = queue_recs("transcribe", to_tx, {})
+        if wait_for(added + existing, "Transcribe") is None:
+            return
+
+    if opts.get("summarize", True):
+        pending = {e["id"] for e in inbox_pending()}
+        to_sum = [r["id"] for r in list_recordings()["recordings"]
+                  if r["id"] in pending and not r.get("summarized")]
+        if to_sum:
+            model = opts.get("model") or models().get("default")
+            if not model:
+                note("No LM Studio model available; skipping summaries")
+            else:
+                note(f"Summarizing {len(to_sum)} recording(s) with {model}")
+                added, existing = queue_recs("summarize", to_sum, {"model": model})
+                if wait_for(added + existing, "Summarize") is None:
+                    return
+
+    n = len(inbox_pending())
+    job["result"] = {"pending": n}
+    note(f"{n} recording(s) waiting for review")
+
+
+@app.post("/api/inbox/run")
+def inbox_run(body: dict = Body(default={})):
+    """Queue an inbox job: {"sync": "ble"|"usb"|"none", "summarize": true,
+    "model": optional}. Returns the job; an inbox job already queued is
+    returned instead of adding another."""
+    sync = body.get("sync", "ble")
+    if sync not in ("ble", "usb", "none"):
+        raise HTTPException(400, "sync must be ble, usb or none")
+    with queue.lock:
+        same = next((j for j in queue.jobs if j["kind"] == "inbox" and active(j)), None)
+    if same:
+        return {"job": job_view(same), "existing": True}
+    job = queue.add("inbox", [], {"sync": sync, "summarize": bool(body.get("summarize", True)),
+                                  "model": body.get("model")})
+    return {"job": job_view(job), "existing": False}
+
+
+@app.get("/api/inbox")
+def inbox():
+    return {"pending": inbox_pending()}
+
+
+def mark_reviewed(rec_id: str, issues: list[str], note: str | None) -> dict:
+    mp3 = mp3_for(rec_id)
+    if not side(mp3, ".txt").exists():
+        raise HTTPException(404, f"no transcript for {rec_id}")
+    with META_LOCK:
+        meta = read_json(side(mp3, ".meta.json"), {})
+        box = meta.get("inbox", {})
+        box["reviewed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        box["issues"] = sorted(set(box.get("issues", []) + issues))
+        if note:
+            box["note"] = note
+        meta["inbox"] = box
+        write_json(side(mp3, ".meta.json"), meta)
+    return box
+
+
+@app.post("/api/inbox/mark")
+def inbox_mark(body: dict = Body(...)):
+    """{"id": "2026-11-13/20261113140200", "issues": [urls], "note": text}"""
+    rec_id = str(body.get("id", "")).removesuffix(".mp3")
+    issues = body.get("issues") or []
+    if not isinstance(issues, list) or not all(isinstance(i, str) for i in issues):
+        raise HTTPException(400, "issues must be a list of URLs")
+    return {rec_id: mark_reviewed(rec_id, issues, body.get("note"))}
+
+
+@app.post("/api/inbox/baseline")
+def inbox_baseline():
+    """Mark every recording waiting for review as reviewed, filing nothing."""
+    ids = [e["id"] for e in inbox_pending()]
+    for rec_id in ids:
+        mark_reviewed(rec_id, [], "baseline")
+    return {"marked": len(ids)}
+
+
+@app.get("/api/inbox/projects")
+def inbox_projects():
+    if not PROJECTS.exists():
+        raise HTTPException(404, f"{PROJECTS} not found; copy docs/projects.example.toml "
+                                 "there and edit it")
+    try:
+        return tomllib.loads(PROJECTS.read_text())
+    except tomllib.TOMLDecodeError as e:
+        raise HTTPException(500, f"projects.toml: {e}")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     # no-store: always fetch the current page, so app updates show after a reload
@@ -672,7 +866,7 @@ def index():
 
 def main():
     REC_DIR.mkdir(exist_ok=True)
-    for lane in ("gpu", "device"):
+    for lane in ("gpu", "device", "inbox"):
         threading.Thread(target=queue.worker, args=(lane,), daemon=True).start()
     port = int(os.environ.get("POCKET_APP_PORT", "8765"))
     print(f"Pocket Recordings: http://localhost:{port}")

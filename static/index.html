@@ -556,7 +556,7 @@ document.addEventListener('keydown', e => {
 });
 
 // ── queue ───────────────────────────────────────────
-const KIND = { transcribe: 'Transcribe', summarize: 'Summarize', sync_ble: 'Sync (Bluetooth)', sync_usb: 'Sync (USB)', delete_device: 'Delete from recorder' };
+const KIND = { transcribe: 'Transcribe', summarize: 'Summarize', sync_ble: 'Sync (Bluetooth)', sync_usb: 'Sync (USB)', delete_device: 'Delete from recorder', inbox: 'Inbox (sync, transcribe, summarize)' };
 function openQueue() { $('#queue').classList.add('open'); }
 $('#queueBtn').onclick = () => $('#queue').classList.toggle('open');
 $('#qClose').onclick = () => $('#queue').classList.remove('open');

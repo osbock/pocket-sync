@@ -5,34 +5,52 @@ description: Download new Pocket recordings, transcribe and summarize them, then
 
 # Pocket inbox
 
-Run from the pocket-sync repo on the Mac. The web app (`app.py`) must be
-running: it owns Bluetooth, Whisper and LM Studio. Never call
-`pocket_sync.py` directly from this shell (Bluetooth fails with exit 134).
+Works from any directory. Everything goes through the Pocket Recordings web
+app's local API at `http://127.0.0.1:8765` (port: `$POCKET_APP_PORT` if
+set); it owns Bluetooth, Whisper and LM Studio. Never run `pocket_sync.py`
+or `transcribe.py` yourself. Use `jq` to read the JSON.
+
+If `curl` can't connect, tell the user to open the Pocket Recordings
+launcher app; don't start it yourself.
 
 ## 1. Fetch and process
 
 ```
-uv run tools/pocket_inbox.py run
+curl -s -X POST http://127.0.0.1:8765/api/inbox/run \
+  -H 'Content-Type: application/json' -d '{"sync": "ble"}' | jq '.job.id'
 ```
 
-This syncs over Bluetooth, transcribes anything new, summarizes it, and
-prints JSON `{"pending": [...]}` of recordings not yet reviewed (id, title,
-speakers, transcript and summary paths). Progress goes to stderr. Run it in
-the background if it may take a while (transcription runs at about 1/10 of
-real time). Flags: `--no-sync` (only process what's already here), `--usb`.
+This queues an "inbox" job that syncs over Bluetooth, transcribes anything
+new and summarizes it. `"sync"` can be `"ble"`, `"usb"` or `"none"` (only
+process what's already on the Mac); add `"summarize": false` to skip
+summaries. If one is already queued you get that job back
+(`"existing": true`).
 
-If the app isn't reachable, tell the user to open the Pocket launcher app;
-don't start it yourself.
+Wait for it (transcription runs at about 1/10 of real time). Repeat this
+until `status` is `done`, `failed` or `cancelled`; each call waits up to
+110 s:
 
-If the sync fails (recorder out of range), say so and carry on; the
-recordings already on this Mac still get processed.
+```
+curl -s 'http://127.0.0.1:8765/api/jobs/<job id>?wait=110' | jq '{status, progress, log, result}'
+```
+
+`log` says what happened, including steps that failed. If the sync failed
+(recorder out of range), say so and carry on; the recordings already on this
+Mac still get processed.
+
+Then list the recordings not yet reviewed (id, title, speakers, transcript
+and summary paths):
+
+```
+curl -s http://127.0.0.1:8765/api/inbox | jq '.pending'
+```
 
 ## 2. Read each pending recording
 
 Get the projects:
 
 ```
-uv run tools/pocket_inbox.py projects
+curl -s http://127.0.0.1:8765/api/inbox/projects
 ```
 
 For each pending recording, read the summary, then the **full transcript**
@@ -109,9 +127,13 @@ before quoting anything sensitive.
 After each recording is done, even ones with nothing to file:
 
 ```
-uv run tools/pocket_inbox.py mark <id> --issue <url> --issue <url>
-uv run tools/pocket_inbox.py mark <id> --note "nothing actionable"
+curl -s -X POST http://127.0.0.1:8765/api/inbox/mark -H 'Content-Type: application/json' \
+  -d '{"id": "<id>", "issues": ["<url>", "<url>"]}'
+curl -s -X POST http://127.0.0.1:8765/api/inbox/mark -H 'Content-Type: application/json' \
+  -d '{"id": "<id>", "note": "nothing actionable"}'
 ```
+
+Build the body with `jq -n` if a note contains quotes.
 
 Only mark a recording once its issues have been filed (or the user declined
 them), so an interrupted run picks it up again.
@@ -124,7 +146,7 @@ links), anything skipped, unmatched or failed.
 ## First run
 
 If `pending` lists a backlog of old recordings the user doesn't want
-reviewed, offer `uv run tools/pocket_inbox.py baseline`, which marks every
+reviewed, offer `curl -s -X POST http://127.0.0.1:8765/api/inbox/baseline`, which marks every
 current recording as reviewed without filing anything.
 
 Private settings are in `~/.config/pocket-sync`; never print or commit

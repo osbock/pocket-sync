@@ -342,7 +342,7 @@ Summaries aren't redone automatically; queue **Summarize again** if it matters.
 
 Say an instruction into the recorder, such as "add an enhancement to spinning
 tops: circles and hexagons as well as snowflakes". Then, in Claude Code in
-this folder, type `/pocket-inbox` or "check my Pocket". Claude downloads
+any folder, type `/pocket-inbox` or "check my Pocket". Claude downloads
 new recordings, transcribes and summarizes them, finds instructions aimed at
 one of your projects, and shows you the issues it would file. It files them
 (labelled `from-pocket`, quoting the transcript line) once you approve.
@@ -353,14 +353,17 @@ works. Setup:
 1. `gh auth login`
 2. `cp docs/projects.example.toml ~/.config/pocket-sync/projects.toml` and
    list your repos with the ways you say their names.
-3. Optional, on first use: `uv run tools/pocket_inbox.py baseline` marks
-   existing recordings as already reviewed.
+3. `./install.sh` links the skill into `~/.claude/skills`, so it works in
+   any folder, not just this one.
+4. Optional, on first use: `curl -X POST localhost:8765/api/inbox/baseline`
+   marks existing recordings as already reviewed.
 
-`tools/pocket_inbox.py` does the mechanical part (`run`, `pending`, `mark`,
-`baseline`, `projects`; see `--help`). Which recordings have been reviewed,
-and the issues filed from them, are kept under `"inbox"` in each
-`<name>.meta.json`. The steps Claude follows are in
-`.claude/skills/pocket-inbox/SKILL.md`.
+The app does the mechanical part through `/api/inbox` endpoints: `run`
+queues an "Inbox" job (sync, transcribe, summarize; it shows in the Queue),
+`GET /api/inbox` lists recordings not yet reviewed, `mark`, `baseline` and
+`projects`. Which recordings have been reviewed, and the issues filed from
+them, are kept under `"inbox"` in each `<name>.meta.json`. The steps Claude
+follows are in `.claude/skills/pocket-inbox/SKILL.md`.
 
 ## Where things are stored
 

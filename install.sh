@@ -232,6 +232,21 @@ else
   warn "Launcher not built (or built for another folder). Run ./make_app.sh"
 fi
 
+# --- Claude skill -----------------------------------------------------------
+step "Claude Code skill (/pocket-inbox)"
+SKILL_SRC="$HERE/.claude/skills/pocket-inbox"
+SKILL_DST="$HOME/.claude/skills/pocket-inbox"
+if [ "$(readlink "$SKILL_DST" 2>/dev/null)" = "$SKILL_SRC" ]; then
+  ok "/pocket-inbox is available in every folder"
+elif [ -e "$SKILL_DST" ] && [ ! -L "$SKILL_DST" ]; then
+  warn "$SKILL_DST exists and isn't a link; leaving it alone"
+elif [ "$MODE" = install ]; then
+  mkdir -p "$HOME/.claude/skills" && ln -sfn "$SKILL_SRC" "$SKILL_DST" \
+    && ok "Linked /pocket-inbox into ~/.claude/skills"
+else
+  warn "/pocket-inbox only works inside this folder. Run ./install.sh to link it globally"
+fi
+
 # --- Summary ----------------------------------------------------------------
 echo
 if [ $FAIL -gt 0 ]; then echo "${R}${FAIL} problem(s)${N} and ${WARN} warning(s). Fix the ✗ items and run this again."; exit 1
