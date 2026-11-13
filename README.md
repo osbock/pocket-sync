@@ -2,8 +2,9 @@
 
 Cloud-free tools for the HeyPocket **Pocket** voice recorder (`PKT01_…`):
 download recordings over Bluetooth or USB, transcribe them, label who spoke,
-and summarize them, all on this Mac. Nothing is sent to Pocket's servers or
-any other cloud service.
+and summarize them, all on this Mac (or a Windows PC; see
+[Windows](#windows)). Nothing is sent to Pocket's servers or any other cloud
+service.
 
 | File | What it does |
 |---|---|
@@ -13,6 +14,8 @@ any other cloud service.
 | `static/index.html` | The web app's page |
 | `make_app.sh` | Builds `Pocket Recordings.app` so the web app opens from Launchpad, Spotlight or the Dock |
 | `install.sh` | Checks or sets up everything below on a Mac; exports and imports settings between Macs |
+| `install.ps1`, `make_app.ps1`, `launch.py` | The same on Windows: setup, Start Menu shortcut, launcher |
+| `platform_support.py` | The macOS/Windows differences (audio decoding, USB drive, keep-awake, Trash) |
 
 Each script declares its own dependencies inline, so `uv run <script>` installs
 whatever it needs the first time. No virtualenv to manage.
@@ -189,6 +192,41 @@ on the first Mac.
 - **Don't share `~/PocketRecordings`** through a synced folder and use it from
   both Macs at once: the job queue (`.queue.json`) and download log would be
   written from both sides.
+
+---
+
+## Windows
+
+The same code runs on Windows 10 1809+ and 11. What differs:
+
+| | Mac | Windows |
+|---|---|---|
+| Whisper | mlx-whisper, the model in LM Studio's folder | faster-whisper `large-v3-turbo` (CUDA float16 on an NVIDIA GPU, else CPU int8), downloaded to the Hugging Face cache on first use |
+| Speakers | pyannote on the GPU (MPS) | pyannote on CUDA; the script pulls PyTorch's CUDA build (PyPI's Windows build is CPU-only) |
+| Audio decoding | `afconvert` | PyAV (bundles ffmpeg) |
+| USB sync | remounted read-only, ejected with `diskutil` | drive letter with `RECORD\device.txt`; never written to; ejected via `DeviceIoControl` (Explorer's Eject as fallback) |
+| Keep awake while jobs run | `caffeinate` | `SetThreadExecutionState` |
+| Delete | Trash, in a folder per recording | Recycle Bin |
+| Launcher | `make_app.sh` → `Pocket Recordings.app` | `make_app.ps1` → Start Menu shortcut (`uvw`, no console); log in `%LOCALAPPDATA%\Pocket Recordings\app.log` |
+| Setup | `./install.sh` | `powershell -ExecutionPolicy Bypass -File install.ps1` (same `-Check`, `-Import DIR`, `-Export DIR`) |
+
+- **Hardware:** an NVIDIA GPU with 8 GB+ VRAM is comfortable for Whisper and
+  speakers. For summaries, a mixture-of-experts model works well even when it
+  doesn't fit in VRAM: the Qwen 35B-A3B GGUF (Q4_K_M, 21 GB) on an RTX 3080 Ti
+  (12 GB) with 64 GB RAM summarized a 25-minute recording in 51 s (30 s on an
+  M4 Pro). Dense models that don't fit are much slower; on a small card use an
+  ~8B one. Measured there: Whisper 66x realtime (25 min in 23 s).
+- **Bluetooth:** no permission prompt and no exit-134 problem. Don't pair the
+  recorder in Windows Settings; the scripts connect directly. The saved address
+  is a MAC address on Windows (a UUID on a Mac); `scan` or a sync re-saves it.
+- **Settings and voices** are the same files on both, so `./install.sh --export`
+  on the Mac and `install.ps1 -Import` on the PC carries them over. Voiceprints
+  come from the same pyannote model, so named voices are recognized on both.
+- **Models:** a GGUF model in LM Studio can be copied from the Mac into
+  `%USERPROFILE%\.lmstudio\models\<publisher>\<model>\` instead of downloading
+  it again; MLX models don't work on Windows. See `docs/windows-port.md`.
+- **Session key:** `adb` is `winget install Google.PlatformTools`; use
+  `adb logcat | findstr distinct_id`.
 
 ---
 

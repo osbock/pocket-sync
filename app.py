@@ -1,6 +1,10 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "numpy"]
+# dependencies = [
+#     "fastapi>=0.115", "uvicorn>=0.30", "numpy",
+#     "av>=12; sys_platform != 'darwin'",
+#     "send2trash>=1.8; sys_platform != 'darwin'",
+# ]
 # ///
 """Pocket Recordings: a local web app for browsing, playing, transcribing,
 summarizing and managing Pocket recorder recordings.
@@ -9,7 +13,7 @@ summarizing and managing Pocket recorder recordings.
 
 Start it from Terminal (or the terminal tab in the Claude app) so the
 Bluetooth sync it launches is allowed to use Bluetooth. It only listens on
-this Mac (127.0.0.1).
+this computer (127.0.0.1).
 
 Long-running work goes through a persistent queue with two lanes that run in
 parallel: "gpu" (transcribe, summarize; one at a time) and "device" (sync,
@@ -22,8 +26,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
-import signal
 import subprocess
 import threading
 import tomllib
@@ -37,6 +39,8 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
 import llm
+from platform_support import (CHILD_ENV, LMS, NO_WINDOW, KeepAwake, decode_audio, find_uv,
+                              kill_job, spawn_job, trash)
 
 HERE = Path(__file__).resolve().parent
 REC_DIR = Path(os.environ.get("POCKET_RECORDINGS") or Path.home() / "PocketRecordings")
@@ -44,8 +48,7 @@ QUEUE_FILE = REC_DIR / ".queue.json"
 VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
 APP_CFG = Path.home() / ".config" / "pocket-sync" / "app.json"
 PROJECTS = Path.home() / ".config" / "pocket-sync" / "projects.toml"
-LMS = Path.home() / ".lmstudio" / "bin" / "lms"
-UV = shutil.which("uv") or "/opt/homebrew/bin/uv"
+UV = find_uv()
 BYTES_PER_SECOND = 4000
 SHORT_SECONDS = 3
 ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/[A-Za-z0-9_-]+$")
@@ -60,7 +63,7 @@ META_LOCK = threading.Lock()  # read-modify-write of <name>.meta.json
 
 def read_json(path: Path, default):
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
@@ -68,7 +71,7 @@ def read_json(path: Path, default):
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -164,7 +167,7 @@ def list_recordings(q: str = "", short: bool = False):
             if any(ql in s.lower() for s in r["speakers"]):
                 return True
             txt = REC_DIR / f"{r['id']}.txt"
-            return txt.exists() and ql in txt.read_text().lower()
+            return txt.exists() and ql in txt.read_text(encoding="utf-8").lower()
         recs = [r for r in recs if hit(r)]
     recs.sort(key=lambda r: r["id"], reverse=True)
     return {"recordings": recs, "device_updated": dev.get("updated")}
@@ -198,7 +201,7 @@ def get_recording(date: str, name: str):
             })
     summary = side(mp3, ".summary.md")
     info.update(segments=segs, speaker_details=speakers,
-                summary=summary.read_text() if summary.exists() else None)
+                summary=summary.read_text(encoding="utf-8") if summary.exists() else None)
     return info
 
 
@@ -209,14 +212,7 @@ def peaks(date: str, name: str, n: int = 1200):
     cached = read_json(cache, None)
     if cached and cached.get("n") == n:
         return cached
-    import tempfile
-    import wave
-    with tempfile.TemporaryDirectory() as td:
-        wav = Path(td) / "a.wav"
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@8000", "-c", "1",
-                        str(mp3), str(wav)], check=True, capture_output=True)
-        with wave.open(str(wav)) as w:
-            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    pcm = decode_audio(mp3, 8000)
     a = np.abs(pcm.astype(np.float32)) / 32768.0
     if len(a) == 0:
         vals = []
@@ -256,7 +252,8 @@ def set_title(date: str, name: str, body: dict = Body(...)):
 
 def run_cli(args: list[str], timeout: int = 120) -> str:
     r = subprocess.run([UV, "run", *args], cwd=HERE, capture_output=True, text=True,
-                       timeout=timeout, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                       encoding="utf-8", errors="replace", timeout=timeout, env=CHILD_ENV,
+                       creationflags=NO_WINDOW)
     if r.returncode != 0:
         msg = (r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or ["failed"])[-1]
         raise HTTPException(500, msg)
@@ -303,7 +300,8 @@ def forget_voice(person: str):
 
 @app.post("/api/delete")
 def delete(body: dict = Body(...)):
-    """Mac copies go to the Trash; recorder deletions are queued as a device job."""
+    """Local copies go to the Trash (Recycle Bin on Windows); recorder
+    deletions are queued as a device job."""
     ids = body.get("ids") or []
     for rec_id in ids:
         mp3_for(rec_id)
@@ -331,10 +329,7 @@ def delete(body: dict = Body(...)):
                     write_json(meta_file, meta)
             if not files:
                 continue
-            dest = Path.home() / ".Trash" / f"Pocket {rec_id.replace('/', ' ')} {stamp}"
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                shutil.move(str(f), dest / f.name)
+            trash(files, f"Pocket {rec_id.replace('/', ' ')} {stamp}")
             # Remember it was deleted on purpose so sync doesn't download it again.
             manifest.setdefault(f"{rec_id}.mp3", {})["deleted_locally"] = True
             if body.get("mac"):
@@ -401,10 +396,12 @@ def ensure_model_loaded(model: str, job: dict) -> None:
     for m in ms:
         if m["state"] == "loaded":
             job["progress"] = f"Unloading {m['id']} in LM Studio"
-            subprocess.run([str(LMS), "unload", m["id"]], capture_output=True, timeout=120)
+            subprocess.run([str(LMS), "unload", m["id"]], capture_output=True, timeout=120,
+                           creationflags=NO_WINDOW)
     job["progress"] = f"Loading {model} in LM Studio"
     r = subprocess.run([str(LMS), "load", model, "--context-length", str(llm.CONTEXT), "-y"],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=600, creationflags=NO_WINDOW)
     if r.returncode != 0:
         raise RuntimeError(f"Could not load {model}: {(r.stderr or r.stdout).strip()[-200:]}")
 
@@ -426,7 +423,7 @@ class Queue:
                 j.update(status="pending", progress="Restarted after the app was closed")
         self.procs: dict[str, subprocess.Popen] = {}
         self.wake = threading.Event()
-        self.caffeinate: subprocess.Popen | None = None
+        self.awake = KeepAwake()
         self.stopping = False
         self.save()
 
@@ -460,10 +457,7 @@ class Queue:
                 j["cancel"] = True
                 p = self.procs.get(job_id)
                 if p:
-                    try:
-                        os.killpg(p.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                    kill_job(p)
             self.save()
 
     def move(self, job_id: str, direction: int):
@@ -496,13 +490,8 @@ class Queue:
         return None
 
     def update_caffeinate(self):
-        busy = any(j["status"] in ("pending", "running") for j in self.jobs)
-        if busy and (self.caffeinate is None or self.caffeinate.poll() is not None):
-            # Keep the Mac from idle-sleeping while there is queued work.
-            self.caffeinate = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
-        elif not busy and self.caffeinate and self.caffeinate.poll() is None:
-            self.caffeinate.terminate()
-            self.caffeinate = None
+        # Keep the computer from idle-sleeping while there is queued work.
+        self.awake.set(any(j["status"] in ("pending", "running") for j in self.jobs))
 
     def worker(self, lane: str):
         while True:
@@ -570,9 +559,8 @@ def run_job(q: Queue, job: dict) -> None:
     else:
         raise RuntimeError(f"unknown job kind {kind}")
 
-    p = subprocess.Popen([UV, "run", *cmd], cwd=HERE, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, start_new_session=True,
-                         env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    p = spawn_job([UV, "run", *cmd], cwd=HERE, stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT, env=CHILD_ENV)
     q.procs[job["id"]] = p
     buf = b""
     while True:
@@ -694,17 +682,14 @@ def shutdown():
         with queue.lock:
             queue.stopping = True
             for job_id, p in list(queue.procs.items()):
-                try:
-                    os.killpg(p.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                kill_job(p)
             for j in queue.jobs:
                 if j["status"] == "running":
                     j.update(status="pending", progress="Stopped when the app quit")
             queue.save()
-        if queue.caffeinate and queue.caffeinate.poll() is None:
-            queue.caffeinate.terminate()
-        os.kill(os.getpid(), signal.SIGTERM)
+        queue.awake.stop()
+        if SERVER:
+            SERVER.should_exit = True
     threading.Thread(target=stop, daemon=True).start()
     return {"ok": True}
 
@@ -865,7 +850,7 @@ def inbox_projects():
         raise HTTPException(404, f"{PROJECTS} not found; copy docs/projects.example.toml "
                                  "there and edit it")
     try:
-        return tomllib.loads(PROJECTS.read_text())
+        return tomllib.loads(PROJECTS.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise HTTPException(500, f"projects.toml: {e}")
 
@@ -873,17 +858,27 @@ def inbox_projects():
 @app.get("/", response_class=HTMLResponse)
 def index():
     # no-store: always fetch the current page, so app updates show after a reload
-    return HTMLResponse((HERE / "static" / "index.html").read_text(),
+    return HTMLResponse((HERE / "static" / "index.html").read_text(encoding="utf-8"),
                         headers={"Cache-Control": "no-store"})
 
 
+SERVER: uvicorn.Server | None = None
+
+
 def main():
+    global SERVER
+    import sys
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__)  # also used by the installers to install the packages
+        return
     REC_DIR.mkdir(exist_ok=True)
     for lane in ("gpu", "device", "inbox"):
         threading.Thread(target=queue.worker, args=(lane,), daemon=True).start()
     port = int(os.environ.get("POCKET_APP_PORT", "8765"))
     print(f"Pocket Recordings: http://localhost:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    SERVER = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
+                                           log_level="warning"))
+    SERVER.run()
 
 
 if __name__ == "__main__":

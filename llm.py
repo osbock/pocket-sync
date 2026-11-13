@@ -33,7 +33,7 @@ def server_url(override: str | None = None) -> str:
     url = override
     if not url:
         try:
-            url = json.loads(APP_CFG.read_text()).get("llm_url")
+            url = json.loads(APP_CFG.read_text(encoding="utf-8")).get("llm_url")
         except (FileNotFoundError, ValueError):
             url = None
     url = (url or DEFAULT_URL).strip().rstrip("/")

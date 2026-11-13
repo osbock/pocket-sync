@@ -1,7 +1,12 @@
 # Windows port: plan
 
-Status (2026-11-12): **planned, not started.** Everything here was worked out
-on the Mac; nothing has been tried on Windows yet.
+Status (2026-11-13): **code ported, partly tested on Windows** (Windows 11,
+RTX 3080 Ti 12 GB). Done: `platform_support.py` (decode, USB drive find/eject,
+keep-awake, spawn/kill job, trash), faster-whisper backend and CUDA device in
+`transcribe.py`, CUDA PyTorch index in its PEP 723 header, explicit UTF-8 for
+every text file read/write, `install.ps1`, `make_app.ps1` + `launch.py`
+(Start Menu shortcut), README section. See "Test results" at the end for what
+has been checked on real hardware and what hasn't.
 
 Goal: one codebase that runs on macOS (Apple Silicon) and Windows 10 1809+/11.
 Don't fork. The Mac must keep working exactly as it does now.
@@ -98,3 +103,42 @@ Worked out 2026-11-13 from what is on the Mac:
 
 Estimated effort: 2–3 days, mostly testing faster-whisper output and USB eject
 on real hardware.
+
+## Test results (Windows 11, RTX 3080 Ti 12 GB, 2026-11-13)
+
+Checked:
+
+- Bluetooth: `scan`, `info`, `list` (bleak WinRT; no pairing, no prompt).
+- `pull --usb`: found as a removable exFAT drive (label "Pocket", USB ID
+  ZEPHYR USB DISK), 12 recordings / 24.6 MB in 22 s, eject via
+  `DeviceIoControl` keeps it gone. **Order matters:** cable unplugged, USB mode
+  on, then plug in. Plugging in before USB mode is on gives only charging, and
+  unplugging turns USB mode off. Right after the eject the recorder dropped the
+  Bluetooth connection once, so `usb off` now retries (3 attempts).
+- A real 25-min recording: Whisper 23 s (66x realtime) on the 3080 Ti, and
+  both speakers recognized from `voices.json` imported from the Mac (0.84 and
+  1.0), so voiceprints carry over.
+- Summary + title of that recording with LM Studio and the 35B-A3B GGUF
+  copied from the Mac: 51 s (11.4 of 12 GB VRAM used, the rest in RAM).
+- faster-whisper on CUDA (float16) and pyannote on CUDA, on a 32 s two-voice
+  test clip: exact transcript, both speakers separated. `transcribe.py
+  --check-gpu` prints the device.
+- PyAV decoding at 16 kHz and 8 kHz (waveform).
+- Web app: list, waveform, audio, delete to Recycle Bin, Quit
+  (`server.should_exit`), cancel kills the `uv` + python tree (taskkill /T).
+- `launch.py` via `uvw`: the server outlives the launcher.
+- `install.ps1`: `-Check`, `-Import` of a Mac export.
+
+Not yet checked:
+
+- `pull` over Bluetooth (downloads); a full `pull --usb` run after the retry fix.
+- A side-by-side diff with the Mac's transcript of the same recording.
+- Keep-awake during a long job (`powercfg /requests` as admin shows it).
+- The web app's `lms.exe` load/unload of the summary model.
+- The Start Menu shortcut itself (`make_app.ps1`), and the icon.
+- Everything again on the Mac (mlx-whisper path, afconvert, Trash folder,
+  caffeinate, and the new `should_exit` shutdown).
+
+Found while testing: `uv run app.py --help` started the server instead of
+printing help, which hung `install.sh` and `install.ps1` at the packages
+step; fixed for both.

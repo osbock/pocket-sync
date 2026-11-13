@@ -1,15 +1,32 @@
 # /// script
 # requires-python = ">=3.11,<3.13"
-# dependencies = ["mlx-whisper>=0.4", "numpy", "pyannote.audio>=4.0"]
+# dependencies = [
+#     "mlx-whisper>=0.4; sys_platform == 'darwin'",
+#     "faster-whisper>=1.1; sys_platform != 'darwin'",
+#     "numpy",
+#     "pyannote.audio>=4.0",
+#     "torch",
+#     "torchaudio",
+# ]
+# # PyPI's Windows torch is CPU-only; take the CUDA build there.
+# [tool.uv.sources]
+# torch = { index = "pytorch-cuda", marker = "sys_platform == 'win32'" }
+# torchaudio = { index = "pytorch-cuda", marker = "sys_platform == 'win32'" }
+# [[tool.uv.index]]
+# name = "pytorch-cuda"
+# url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
 # ///
 """Transcribe Pocket recordings locally, label speakers, optionally summarize.
 
-Speech-to-text: the MLX Whisper model in LM Studio's model folder.
+Speech-to-text: Whisper large-v3-turbo. On a Mac, the MLX model in LM
+Studio's model folder; on Windows, faster-whisper (CUDA if there's an NVIDIA
+GPU, else CPU), downloaded to the Hugging Face cache on first use.
 Speakers: pyannote speaker-diarization-community-1 (Hugging Face login and
 accepted model terms needed once, for the download). Voiceprints of people
 you name are kept in ~/.config/pocket-sync/voices.json and recognized in
 later recordings. Summaries: a local LLM server (LM Studio, Ollama or
-llama.cpp; see llm.py). Nothing leaves this Mac.
+llama.cpp; see llm.py). Nothing leaves this computer.
 
     uv run transcribe.py                       # every recording without a transcript
     uv run transcribe.py --largest             # just the longest untranscribed one
@@ -31,21 +48,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import time
-import wave
 from pathlib import Path
 
 import numpy as np
 
 import llm
+from platform_support import IS_MAC, decode_audio
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 REC_DIR = Path.home() / "PocketRecordings"
-WHISPER = Path.home() / ".lmstudio/models/mlx-community/whisper-large-v3-turbo"
+WHISPER = Path.home() / ".lmstudio/models/mlx-community/whisper-large-v3-turbo"  # Mac
+FW_MODEL = os.environ.get("POCKET_WHISPER_MODEL", "large-v3-turbo")  # faster-whisper
 DIARIZER = "pyannote/speaker-diarization-community-1"
 VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
 SR = 16000
@@ -60,14 +76,8 @@ MATCH_THRESHOLD = 0.70
 # ── audio ───────────────────────────────────────────────────────────
 
 def load_audio(mp3: Path) -> np.ndarray:
-    """Decode to 16 kHz mono float32 with macOS's afconvert (no ffmpeg needed)."""
-    with tempfile.TemporaryDirectory() as td:
-        wav = Path(td) / "a.wav"
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", f"LEI16@{SR}", "-c", "1",
-                        str(mp3), str(wav)], check=True, capture_output=True)
-        with wave.open(str(wav)) as w:
-            pcm = w.readframes(w.getnframes())
-    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    """Decode to 16 kHz mono float32 (afconvert on macOS, PyAV elsewhere)."""
+    return decode_audio(mp3, SR).astype(np.float32) / 32768.0
 
 
 def ts(sec: float, srt: bool = False) -> str:
@@ -80,15 +90,46 @@ def ts(sec: float, srt: bool = False) -> str:
 
 # ── transcription ──────────────────────────────────────────────────
 
+def torch_device() -> str:
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def transcribe(audio: np.ndarray, language: str | None) -> dict:
-    import mlx_whisper
-    return mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=str(WHISPER),
-        language=language,
-        condition_on_previous_text=False,  # fewer runaway repetitions on long audio
-        verbose=None,
-    )
+    """{"language": ..., "segments": [{"start", "end", "text"}, ...]}"""
+    if IS_MAC:
+        import mlx_whisper
+        return mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=str(WHISPER),
+            language=language,
+            condition_on_previous_text=False,  # fewer runaway repetitions on long audio
+            verbose=None,
+        )
+    model = whisper_model()
+    segments, info = model.transcribe(audio, language=language,
+                                      condition_on_previous_text=False)
+    return {"language": info.language,
+            "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]}
+
+
+_whisper = None
+
+
+def whisper_model():
+    global _whisper
+    if _whisper is None:
+        # torch first: on Windows its CUDA build brings the cuBLAS/cuDNN DLLs
+        # that CTranslate2 (faster-whisper) needs.
+        cuda = torch_device() == "cuda"
+        from faster_whisper import WhisperModel
+        _whisper = WhisperModel(FW_MODEL, device="cuda" if cuda else "cpu",
+                                compute_type="float16" if cuda else "int8")
+    return _whisper
 
 
 # ── diarization and voices ─────────────────────────────────────────
@@ -111,8 +152,8 @@ def diarizer():
             )
         if _pipeline is None:
             sys.exit(f"Could not load {DIARIZER}; check your Hugging Face login and access.")
-        if torch.backends.mps.is_available():
-            _pipeline.to(torch.device("mps"))
+        if torch_device() != "cpu":
+            _pipeline.to(torch.device(torch_device()))
     return _pipeline
 
 
@@ -129,7 +170,7 @@ def diarize(audio: np.ndarray, num_speakers: int | None) -> dict:
     file = {"waveform": torch.from_numpy(audio)[None], "sample_rate": SR}
     try:
         out = diarizer()(file, **kwargs)
-    except Exception as e:  # rare MPS kernel gaps: retry on CPU
+    except Exception as e:  # rare MPS kernel gaps or GPU memory: retry on CPU
         print(f" (GPU diarization failed: {type(e).__name__}; retrying on CPU)", end="", flush=True)
         diarizer().to(torch.device("cpu"))
         out = diarizer()(file, **kwargs)
@@ -150,7 +191,7 @@ def diarize(audio: np.ndarray, num_speakers: int | None) -> dict:
 
 def load_voices() -> dict:
     try:
-        return json.loads(VOICES.read_text())
+        return json.loads(VOICES.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
 
@@ -159,7 +200,7 @@ def save_voices(voices: dict) -> None:
     VOICES.parent.mkdir(parents=True, exist_ok=True)
     tmp = VOICES.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(voices, f, indent=1)
     tmp.replace(VOICES)
 
@@ -224,8 +265,8 @@ def paths(mp3: Path) -> dict:
 def render(mp3: Path) -> Path:
     """(Re)write .txt and .srt from .json segments and .speakers.json names."""
     p = paths(mp3)
-    data = json.loads(p["json"].read_text())
-    diar = json.loads(p["spk"].read_text()) if p["spk"].exists() else None
+    data = json.loads(p["json"].read_text(encoding="utf-8"))
+    diar = json.loads(p["spk"].read_text(encoding="utf-8")) if p["spk"].exists() else None
     names = display_names(diar)
     segs = data["segments"]
 
@@ -243,13 +284,13 @@ def render(mp3: Path) -> Path:
             buf = []
     if buf:
         lines.append(f"[{ts(start)}] " + (f"{cur}: " if cur else "") + " ".join(buf))
-    p["txt"].write_text("\n".join(lines) + "\n")
+    p["txt"].write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     p["srt"].write_text("".join(
         f"{i}\n{ts(s['start'], True)} --> {ts(s['end'], True)}\n"
         + (f"{names.get(s.get('speaker'), 'Unknown')}: " if diar else "")
         + f"{s['text'].strip()}\n\n"
-        for i, s in enumerate(segs, 1)))
+        for i, s in enumerate(segs, 1)), encoding="utf-8")
     return p["txt"]
 
 
@@ -266,7 +307,7 @@ def default_model(url: str) -> str:
 
 
 def summarize(txt: Path, url: str, model: str, think: bool = False) -> Path:
-    transcript = txt.read_text()
+    transcript = txt.read_text(encoding="utf-8")
     prompt = (
         "Below is a transcript of a voice recording made with a pocket recorder. "
         "Lines are labelled with the speaker where known ('Speaker A' etc. are "
@@ -282,7 +323,7 @@ def summarize(txt: Path, url: str, model: str, think: bool = False) -> Path:
     # summary doesn't need it. Use --think to turn it back on.
     text = llm.chat(url, model, prompt, think)
     out = txt.with_suffix(".summary.md")
-    out.write_text(f"# {txt.stem}\n\n_Summarized locally with {llm.short(model)}_\n\n{text}\n")
+    out.write_text(f"# {txt.stem}\n\n_Summarized locally with {llm.short(model)}_\n\n{text}\n", encoding="utf-8")
     return out
 
 
@@ -292,13 +333,13 @@ def meta_path(mp3: Path) -> Path:
 
 def load_meta(mp3: Path) -> dict:
     try:
-        return json.loads(meta_path(mp3).read_text())
+        return json.loads(meta_path(mp3).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
 
 
 def save_meta(mp3: Path, meta: dict) -> None:
-    meta_path(mp3).write_text(json.dumps(meta, indent=1, ensure_ascii=False))
+    meta_path(mp3).write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
 def suggest_title(mp3: Path, summary: Path, url: str, model: str) -> str | None:
@@ -308,7 +349,7 @@ def suggest_title(mp3: Path, summary: Path, url: str, model: str) -> str | None:
         return None
     title = llm.chat(url, model, "Give a short, specific title (at most 8 words) for the "
                      "recording summarized below. Reply with the title only, no quotes.\n\n"
-                     + summary.read_text(), timeout=300)
+                     + summary.read_text(encoding="utf-8"), timeout=300)
     title = title.splitlines()[0].strip().strip('"*#').strip()[:100] if title else ""
     if title:
         meta.update(title=title, title_source="llm")
@@ -359,14 +400,14 @@ def process(mp3: Path, args, voices: dict, model: str | None) -> None:
         diar = match(diarize(audio, args.num_speakers), voices, args.threshold)
         for s in segs:
             s["speaker"] = speaker_for(s, diar["turns"])
-        p["spk"].write_text(json.dumps(diar, indent=1))
+        p["spk"].write_text(json.dumps(diar, indent=1), encoding="utf-8")
         found = ", ".join(f"{s.get('name') or lab} {s['seconds'] / 60:.1f} min"
                           + (f" (match {s['score']:.2f})" if s.get("score") else "")
                           for lab, s in diar["speakers"].items())
         print(f" {time.monotonic() - t0:.0f}s: {found or 'no speech found'}")
 
     p["json"].write_text(json.dumps(
-        {"language": result.get("language"), "segments": segs}, indent=1, ensure_ascii=False))
+        {"language": result.get("language"), "segments": segs}, indent=1, ensure_ascii=False), encoding="utf-8")
     txt = render(mp3)
     print(f"    -> {txt.name}", flush=True)
     summarize_step(mp3, txt, args, model)
@@ -390,8 +431,8 @@ def cmd_speakers(args) -> None:
     p = paths(mp3)
     if not p["spk"].exists():
         sys.exit(f"No speaker data for {mp3.name}; transcribe it first (with --force if needed).")
-    diar = json.loads(p["spk"].read_text())
-    data = json.loads(p["json"].read_text())
+    diar = json.loads(p["spk"].read_text(encoding="utf-8"))
+    data = json.loads(p["json"].read_text(encoding="utf-8"))
     voices = load_voices()
     print(f"{mp3.parent.name}/{mp3.name}")
     for label, s in diar["speakers"].items():
@@ -411,7 +452,7 @@ def cmd_name(args) -> None:
     ref, label, name = args.name
     mp3 = find_recording(ref, args.dir)
     p = paths(mp3)
-    diar = json.loads(p["spk"].read_text())
+    diar = json.loads(p["spk"].read_text(encoding="utf-8"))
     label = next((k for k in diar["speakers"] if k.lower() == label.lower()), label)
     if label not in diar["speakers"]:
         sys.exit(f"{label} not in {mp3.name}; it has: {', '.join(diar['speakers'])}")
@@ -424,7 +465,7 @@ def cmd_name(args) -> None:
             if other is not spk and other.get("name") == name:
                 other.update(name=None, score=None, pinned=False)
         spk.update(name=name, score=None, pinned=True)
-        p["spk"].write_text(json.dumps(diar, indent=1))
+        p["spk"].write_text(json.dumps(diar, indent=1), encoding="utf-8")
         render(mp3)
         print(f"{label} in {mp3.stem} is now {name} (no voiceprint saved).")
         return
@@ -446,7 +487,7 @@ def cmd_name(args) -> None:
     save_voices(voices)
 
     spk.update(name=name, score=None, pinned=True)
-    p["spk"].write_text(json.dumps(diar, indent=1))
+    p["spk"].write_text(json.dumps(diar, indent=1), encoding="utf-8")
     render(mp3)
     print(f"{label} in {mp3.stem} is now {name} "
           f"({voices[name]['samples']} sample(s), {voices[name]['weight'] / 60:.1f} min of speech).")
@@ -474,8 +515,8 @@ def cmd_move(args) -> None:
     p = paths(mp3)
     if not p["spk"].exists():
         sys.exit(f"No speaker data for {mp3.name}; transcribe it with speakers first.")
-    data = json.loads(p["json"].read_text())
-    diar = json.loads(p["spk"].read_text())
+    data = json.loads(p["json"].read_text(encoding="utf-8"))
+    diar = json.loads(p["spk"].read_text(encoding="utf-8"))
     segs = data["segments"]
     idx = parse_range(spec, len(segs))
 
@@ -505,8 +546,8 @@ def cmd_move(args) -> None:
         s["speaker"], s["moved"] = target, True
         moved += 1
 
-    p["json"].write_text(json.dumps(data, indent=1, ensure_ascii=False))
-    p["spk"].write_text(json.dumps(diar, indent=1))
+    p["json"].write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+    p["spk"].write_text(json.dumps(diar, indent=1), encoding="utf-8")
     render(mp3)
     print(f"Moved {moved} line(s) in {mp3.stem} to {spk[target].get('name') or target}.")
 
@@ -523,12 +564,12 @@ def cmd_rematch(args) -> None:
     voices = load_voices()
     for spk_file in sorted(args.dir.glob("*/*.speakers.json")):
         mp3 = spk_file.with_name(spk_file.name.replace(".speakers.json", ".mp3"))
-        diar = json.loads(spk_file.read_text())
+        diar = json.loads(spk_file.read_text(encoding="utf-8"))
         for s in diar["speakers"].values():  # drop pins on voices that were deleted
             if s.get("pinned") and s.get("name") not in voices and not s.get("manual"):
                 s.update(name=None, pinned=False)
         diar = match(diar, voices, args.threshold)
-        spk_file.write_text(json.dumps(diar, indent=1))
+        spk_file.write_text(json.dumps(diar, indent=1), encoding="utf-8")
         render(mp3)
         names = [s.get("name") or lab for lab, s in diar["speakers"].items()]
         print(f"{mp3.stem}: {', '.join(names)}")
@@ -553,6 +594,8 @@ def main():
     ap.add_argument("--summary-only", action="store_true",
                     help="summarize existing transcripts without re-transcribing")
     ap.add_argument("--no-title", action="store_true", help="don't suggest a title")
+    ap.add_argument("--check-gpu", action="store_true",
+                    help="print the device Whisper and speakers will use (cuda, mps or cpu)")
     ap.add_argument("--model", help="model id for summaries (default: the loaded one)")
     ap.add_argument("--llm-url", help="LLM server, e.g. http://localhost:11434 for Ollama "
                     f"(default: llm_url in app.json, else {llm.DEFAULT_URL})")
@@ -565,6 +608,11 @@ def main():
     g.add_argument("--rematch", action="store_true", help="relabel all transcripts")
     args = ap.parse_args()
 
+    if args.check_gpu:
+        import torch
+        dev = torch_device()
+        name = torch.cuda.get_device_name(0) if dev == "cuda" else ""
+        return print(f"{dev} {name}".strip())
     if args.speakers:
         return cmd_speakers(args)
     if args.name:
@@ -576,7 +624,7 @@ def main():
     if args.rematch:
         return cmd_rematch(args)
 
-    if not (WHISPER / "config.json").exists():
+    if IS_MAC and not (WHISPER / "config.json").exists():
         sys.exit(f"Whisper model not found at {WHISPER}")
     files = args.files or sorted(args.dir.glob("*/*.mp3"))
     if args.summary_only:

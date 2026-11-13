@@ -28,16 +28,16 @@ import asyncio
 import getpass
 import json
 import os
-import plistlib
 import re
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
+
+from platform_support import COMPUTER, eject_drive, find_drive, prepare_drive
 
 CMD_CHAR = "001120a3-2233-4455-6677-889912345678"    # write APP&..., notify MCU&...
 AUDIO_CHAR = "001120a1-2233-4455-6677-889912345678"  # notify: MP3 bytes
@@ -53,7 +53,7 @@ SAFE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG_PATH.read_text())
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
 
@@ -62,7 +62,7 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     tmp.replace(CONFIG_PATH)
 
@@ -96,7 +96,10 @@ async def find_device(cfg: dict, wait: float = 90.0):
     addr = cfg.get("address")
 
     def is_pocket(d, ad):
-        return d.address == addr or (d.name or ad.local_name or "").startswith(NAME_PREFIX)
+        name = d.name or ad.local_name or ""
+        if name.startswith(NAME_PREFIX) and cfg.get("name") != name:
+            cfg["name"] = name  # Windows often leaves d.name empty later
+        return d.address == addr or name.startswith(NAME_PREFIX)
 
     dev = await BleakScanner.find_device_by_filter(is_pocket, timeout=10.0)
     if dev is None:
@@ -105,11 +108,13 @@ async def find_device(cfg: dict, wait: float = 90.0):
         dev = await BleakScanner.find_device_by_filter(is_pocket, timeout=wait - 10.0)
     if dev is None:
         sys.exit(
-            "Pocket not found. Wake it (press the button), keep it near the Mac, "
+            f"Pocket not found. Wake it (press the button), keep it near the {COMPUTER}, "
             "and make sure the Pocket phone app isn't connected to it."
         )
-    if cfg.get("address") != dev.address:
+    if cfg.get("address") != dev.address or (dev.name and cfg.get("name") != dev.name):
         cfg["address"] = dev.address
+        if dev.name:
+            cfg["name"] = dev.name
         save_config(cfg)
     return dev
 
@@ -287,14 +292,14 @@ def manifest_path(out: Path) -> Path:
 
 def load_manifest(out: Path) -> dict:
     try:
-        return json.loads(manifest_path(out).read_text())
+        return json.loads(manifest_path(out).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
 
 
 def save_manifest(out: Path, manifest: dict) -> None:
     tmp = manifest_path(out).with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(manifest_path(out))
 
 
@@ -312,7 +317,8 @@ async def cmd_scan(cfg, args):
     for d, ad in hits:
         print(f"{d.name or ad.local_name}  address={d.address}  rssi={ad.rssi}")
     if len(hits) == 1:
-        cfg["address"] = hits[0][0].address
+        d, ad = hits[0]
+        cfg.update(address=d.address, name=d.name or ad.local_name)
         save_config(cfg)
         print("Saved this address to the config.")
 
@@ -346,7 +352,7 @@ async def cmd_info(cfg, args):
         wf = await p.ask("WF", "WF")
         spa = await p.ask("SPACE", "SPA")
         usb = await p.ask("GET&USB", "USB")
-        print(f"Device:    {p.device.name}")
+        print(f"Device:    {p.device.name or cfg.get('name') or NAME_PREFIX}")
         print(f"Battery:   {bat}%")
         print(f"Firmware:  {fw} (WiFi {wf})")
         if spa and "&" in spa:
@@ -362,7 +368,7 @@ def save_device_index(out: Path, rel_paths: list[str]) -> None:
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / ".device.tmp"
     tmp.write_text(json.dumps({"updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                               "recordings": sorted(rel_paths)}, indent=1))
+                               "recordings": sorted(rel_paths)}, indent=1), encoding="utf-8")
     tmp.replace(out / ".device.json")
 
 
@@ -447,7 +453,7 @@ async def cmd_pull(cfg, args):
 
 
 async def cmd_delete(cfg, args):
-    """Delete recordings from the recorder (not from this Mac). Each argument
+    """Delete recordings from the recorder (not from this computer). Each argument
     is DATE/NAME, e.g. 2026-11-12/20261112222312."""
     out = Path(args.out).expanduser()
     targets = []
@@ -489,44 +495,23 @@ async def cmd_usb(cfg, args):
     got = await set_usb(cfg, args.state == "on")
     print(f"USB mass storage: {'on' if got == '1' else 'off' if got == '0' else 'no answer'}")
     if args.state == "on" and got == "1":
-        print("Plug the Pocket into the Mac with a data USB-C cable; "
+        print(f"Plug the Pocket into the {COMPUTER} with a data USB-C cable; "
               "it should mount as a drive with a RECORD folder.")
 
 
 # ── USB transfer ───────────────────────────────────────────────────
 
 def pocket_volume() -> Path | None:
-    """A mounted volume that is a Pocket recorder (RECORD/device.txt says PKT01...)."""
-    for vol in Path("/Volumes").iterdir():
-        try:
-            if (vol / "RECORD" / "device.txt").read_text().startswith(NAME_PREFIX):
-                return vol
-        except OSError:
-            continue
-    return None
-
-
-def disk_info(target: str) -> dict:
-    out = subprocess.run(["diskutil", "info", "-plist", target],
-                         capture_output=True, check=True).stdout
-    return plistlib.loads(out)
+    """A mounted drive that is a Pocket recorder (RECORD/device.txt says PKT01...)."""
+    return find_drive(NAME_PREFIX)
 
 
 def remount_read_only(vol: Path) -> Path:
-    """macOS mounts the drive read-write on its own; remount it read-only so
-    nothing more is written to the recorder's storage while we read it."""
-    info = disk_info(str(vol))
-    if not info.get("WritableVolume", True):
-        return vol
-    dev = info["DeviceIdentifier"]
-    subprocess.run(["diskutil", "unmount", dev], capture_output=True, check=True)
-    subprocess.run(["diskutil", "mount", "readOnly", dev], capture_output=True, check=True)
-    return Path(disk_info(dev)["MountPoint"])
+    return prepare_drive(vol)
 
 
 def eject(vol: Path) -> None:
-    whole = disk_info(str(vol))["ParentWholeDisk"]
-    subprocess.run(["diskutil", "eject", whole], capture_output=True, check=True)
+    eject_drive(vol)
 
 
 async def wait_for(check, timeout: float, interval: float = 1.0):
@@ -551,7 +536,8 @@ async def cmd_pull_usb(cfg, args):
         if await set_usb(cfg, True) != "1":
             sys.exit("The Pocket did not confirm USB mode.")
         turned_on = True
-        print("Plug the Pocket into this Mac with a data USB-C cable (waiting up to 5 min)...")
+        print(f"Plug the Pocket into this {COMPUTER} with a data USB-C cable "
+              "(waiting up to 5 min)...")
         vol = await wait_for(pocket_volume, 300)
         if vol is None:
             await set_usb(cfg, False)
@@ -602,17 +588,24 @@ async def cmd_pull_usb(cfg, args):
             eject(vol)
             print("Ejected the Pocket drive.")
         except Exception as e:
-            print(f"Could not eject the drive ({e}); eject it in Finder before unplugging.")
+            where = "Finder" if COMPUTER == "Mac" else "File Explorer"
+            print(f"Could not eject the drive ({e}); eject it in {where} before unplugging.")
 
     # The recorder can't use its storage while USB mode is on and the cable
     # is in, so always switch it back off. Switching off can make the drive
     # reappear briefly; eject it again if so.
     print("Switching USB drive mode off over Bluetooth...")
     got = None
-    try:
-        got = await set_usb(cfg, False)
-    except SystemExit as e:
-        print(e)
+    for attempt in range(1, 4):
+        try:
+            got = await set_usb(cfg, False)
+            break
+        except SystemExit as e:
+            print(e)
+            break
+        except Exception as e:  # the recorder can drop Bluetooth right after an eject
+            print(f"  attempt {attempt}/3: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
     if got != "0":
         print("Could not confirm USB mode is off; run `uv run pocket_sync.py usb off`.")
     again = await wait_for(pocket_volume, 8)
