@@ -12,6 +12,7 @@ any other cloud service.
 | `transcribe.py` | Transcription (Whisper), speaker labelling (pyannote), summaries and titles (LM Studio) |
 | `static/index.html` | The web app's page |
 | `make_app.sh` | Builds `Pocket Recordings.app` so the web app opens from Launchpad, Spotlight or the Dock |
+| `install.sh` | Checks or sets up everything below on a Mac; exports and imports settings between Macs |
 
 Each script declares its own dependencies inline, so `uv run <script>` installs
 whatever it needs the first time. No virtualenv to manage.
@@ -44,6 +45,10 @@ uv run transcribe.py --summarize     # transcribe, label speakers, summarize
 ---
 
 ## One-time setup
+
+`./install.sh` walks through these steps, checking each one and offering to
+fix what's missing; `./install.sh --check` only reports. For a second Mac, see
+[Installing on another Mac](#installing-on-another-mac).
 
 ### 1. Tools
 
@@ -108,6 +113,65 @@ Measured on an M4 Pro (48 GB), 25-minute recording:
 |---|---|
 | Qwen 35B-A3B (MoE) | ~30 s |
 | Qwen 27B dense | ~2.5 min (8.5 min with reasoning on) |
+
+---
+
+## Installing on another Mac
+
+### What it needs
+
+| | |
+|---|---|
+| Mac | Apple Silicon (M1 or later). Intel Macs can't run the MLX Whisper model. |
+| Memory | 16 GB is fine for transcription and speakers. Summaries need the LLM in memory too: the 35B MoE wants 32 GB or more; on 16 GB pick an ~8B model in LM Studio. |
+| Disk | About 2 GB for Python packages and Whisper, plus 15–25 GB per summary model, plus your recordings (about 14 MB per hour). |
+| Accounts | GitHub (the repo is private), Hugging Face (the same account works; its pyannote terms are already accepted). |
+
+### Steps
+
+1. **Command Line Tools:** `xcode-select --install` (git, and Swift for the
+   app icon).
+2. **Homebrew** from [brew.sh](https://brew.sh), then `brew install uv gh`.
+3. **Get the code:** `gh auth login`, then
+   `gh repo clone osbock/pocket-sync ~/pocket-sync`.
+4. **LM Studio** from [lmstudio.ai](https://lmstudio.ai): download a chat model
+   and `mlx-community/whisper-large-v3-turbo`, start the server (Developer tab)
+   and turn on starting it at login. `install.sh` can download Whisper instead.
+5. **Carry your settings over** (optional but saves re-reading the session key
+   and re-naming voices). On this Mac:
+   ```bash
+   ./install.sh --export ~/Desktop/pocket-settings
+   ```
+   AirDrop the folder (or use a USB stick: it holds the recorder's session key
+   and voiceprints, so not email or a synced cloud folder), then delete it here.
+6. **Run the installer** in Terminal on the new Mac:
+   ```bash
+   cd ~/pocket-sync
+   ./install.sh --import ~/Downloads/pocket-settings
+   ```
+   It checks the hardware, uv, Whisper, LM Studio and the Hugging Face login
+   (offering `hf auth login`), installs the Python packages, scans for the
+   recorder and builds the launcher. Delete the imported folder afterwards.
+7. **Open Pocket Recordings** from Launchpad and allow Bluetooth when asked.
+
+Recordings aren't part of the settings. To bring the library across, copy
+`~/PocketRecordings` too (it holds transcripts, titles and summaries), or
+start empty and pull: recordings already deleted from the recorder exist only
+on the first Mac.
+
+### Using two Macs
+
+- **One Bluetooth connection at a time.** The recorder talks to one Mac (or the
+  phone) at once, so don't sync from both at the same moment.
+- **Separate libraries.** Each Mac has its own `~/PocketRecordings` and download
+  log, so each downloads every recording it doesn't have yet. Deleting from the
+  recorder on one Mac means the other never gets that recording.
+- **Voices don't sync.** Speakers named on one Mac stay there. Re-export and
+  import `voices.json` to copy them (importing replaces the file; the old one is
+  kept as `voices.json.before-import.<time>`).
+- **Don't share `~/PocketRecordings`** through a synced folder and use it from
+  both Macs at once: the job queue (`.queue.json`) and download log would be
+  written from both sides.
 
 ---
 

@@ -78,15 +78,19 @@ open "\$URL"
 LAUNCH
 chmod +x "$APP/Contents/MacOS/launch"
 
-# Icon
+# Icon (drawn with Swift; skipped, leaving the generic app icon, if Swift
+# isn't available, e.g. without the Xcode Command Line Tools).
 tmp=$(mktemp -d)
-swift "$HERE/tools/make_icon.swift" "$tmp/icon.png" 2>/dev/null
-mkdir "$tmp/AppIcon.iconset"
-for s in 16 32 128 256 512; do
-  sips -z $s $s "$tmp/icon.png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
-  sips -z $((s * 2)) $((s * 2)) "$tmp/icon.png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
-done
-iconutil -c icns "$tmp/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+if command -v swift >/dev/null 2>&1 && swift "$HERE/tools/make_icon.swift" "$tmp/icon.png" 2>/dev/null; then
+  mkdir "$tmp/AppIcon.iconset"
+  for s in 16 32 128 256 512; do
+    sips -z $s $s "$tmp/icon.png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
+    sips -z $((s * 2)) $((s * 2)) "$tmp/icon.png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$tmp/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+else
+  echo "Note: Swift not available; the app gets the generic icon." >&2
+fi
 rm -rf "$tmp"
 
 # Ad-hoc signature, so macOS can remember the Bluetooth permission.
