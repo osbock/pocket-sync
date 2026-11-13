@@ -1,0 +1,17 @@
+# Copy to ~/.config/pocket-sync/projects.toml and edit.
+# The /pocket-inbox skill uses this to turn "add a feature to <project>" in a
+# recording into a GitHub issue on the right repo. Whisper often splits or
+# misspells names, so list the ways you actually say each one.
+
+label = "from-pocket"        # label put on every issue filed from a recording
+confirm = true               # ask before filing; false files without asking
+
+[projects.pocket-sync]
+repo = "you/pocket-sync"
+description = "Pocket recorder downloader, transcriber and web app"
+aliases = ["pocket sync", "pocket", "the pocket app", "recorder app", "transcription app"]
+
+[projects.my-other-project]
+repo = "you/my-other-project"
+description = "One line so Claude can match it when no name is said"
+aliases = ["other project"]

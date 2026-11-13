@@ -338,6 +338,30 @@ Summaries aren't redone automatically; queue **Summarize again** if it matters.
 
 ---
 
+## Recordings to GitHub issues (`/pocket-inbox`)
+
+Say an instruction into the recorder, such as "add an enhancement to spinning
+tops: circles and hexagons as well as snowflakes". Then, in Claude Code in
+this folder, type `/pocket-inbox` or "check my Pocket". Claude downloads
+new recordings, transcribes and summarizes them, finds instructions aimed at
+one of your projects, and shows you the issues it would file. It files them
+(labelled `from-pocket`, quoting the transcript line) once you approve.
+
+The app must be running; Claude drives it through its job API, so Bluetooth
+works. Setup:
+
+1. `gh auth login`
+2. `cp docs/projects.example.toml ~/.config/pocket-sync/projects.toml` and
+   list your repos with the ways you say their names.
+3. Optional, on first use: `uv run tools/pocket_inbox.py baseline` marks
+   existing recordings as already reviewed.
+
+`tools/pocket_inbox.py` does the mechanical part (`run`, `pending`, `mark`,
+`baseline`, `projects`; see `--help`). Which recordings have been reviewed,
+and the issues filed from them, are kept under `"inbox"` in each
+`<name>.meta.json`. The steps Claude follows are in
+`.claude/skills/pocket-inbox/SKILL.md`.
+
 ## Where things are stored
 
 ```

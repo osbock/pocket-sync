@@ -6,4 +6,5 @@ __pycache__/
 # ~/.config/pocket-sync); never copy them in here.
 *.mp3
 *.part
-.claude/
+.claude/*
+!.claude/skills/
