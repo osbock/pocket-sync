@@ -11,6 +11,7 @@ any other cloud service.
 | `pocket_sync.py` | Talks to the recorder: download (Bluetooth or USB), list, delete, device info |
 | `transcribe.py` | Transcription (Whisper), speaker labelling (pyannote), summaries and titles (LM Studio) |
 | `static/index.html` | The web app's page |
+| `make_app.sh` | Builds `Pocket Recordings.app` so the web app opens from Launchpad, Spotlight or the Dock |
 
 Each script declares its own dependencies inline, so `uv run <script>` installs
 whatever it needs the first time. No virtualenv to manage.
@@ -111,6 +112,28 @@ Measured on an M4 Pro (48 GB), 25-minute recording:
 ---
 
 ## The web app (`app.py`)
+
+### From Launchpad, Spotlight or the Dock
+
+```bash
+./make_app.sh                 # builds ~/Applications/Pocket Recordings.app
+```
+
+What the app does:
+
+- **Opening it** starts the server in the background, if it isn't already
+  running, and opens the page in your default browser. Opening it again
+  while it's running just opens the page.
+- **Quit** (top right of the page) stops the server. A job that was
+  running goes back to the queue and resumes next time.
+- **No Dock icon** of its own: it's the browser tab you use.
+- **Bluetooth:** the app asks macOS for Bluetooth permission the first time a
+  sync runs. Allow it, and syncing works without Terminal.
+- **Logs:** `~/Library/Logs/Pocket Recordings.log`.
+- **If you move this folder,** run `./make_app.sh` again, because the app
+  records its path. `./make_app.sh /Applications` installs for all users.
+
+### From the command line
 
 ```bash
 uv run app.py                          # http://localhost:8765 (127.0.0.1 only)
@@ -277,7 +300,8 @@ local times.
 | Symptom | Fix |
 |---|---|
 | `Pocket not found` | Close the phone app, press the recorder's button, try again. The script already waits up to 90 s. |
-| Exit code 134 on any Bluetooth command | Not allowed to use Bluetooth: run from Terminal.app or the terminal tab and allow the prompt. |
+| Exit code 134 on any Bluetooth command | Not allowed to use Bluetooth: run from Terminal.app, the terminal tab or the Pocket Recordings app, and allow the prompt. |
+| Sync from the app finds nothing | Check System Settings → Privacy & Security → Bluetooth has *Pocket Recordings* switched on. |
 | `MCU&SK&ERR` / key rejected | Wrong session key. Re-read it with `adb logcat`. |
 | Bluetooth transfer stalls | Retried automatically on a fresh connection; or use `pull --usb`. |
 | Recorder shows 0 GB / 0 recordings | USB mode is on with the cable in. Eject, `usb off`, unplug. |

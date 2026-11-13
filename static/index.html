@@ -130,6 +130,7 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
   <select id="syncHow" title="How to sync"><option value="sync_ble">Bluetooth</option><option value="sync_usb">USB cable</option></select>
   <button id="syncBtn" class="primary">Sync</button>
   <button id="queueBtn">Queue</button>
+  <button id="quitBtn" title="Stop the Pocket Recordings server">Quit</button>
 </header>
 <div id="banner"></div>
 <div class="layout">
@@ -509,6 +510,14 @@ $('#qList').addEventListener('click', async e => {
   if (b.dataset.down) await api(`/api/jobs/${b.dataset.down}/move`, { method: 'POST', body: { direction: 'down' } });
   loadJobs();
 });
+$('#quitBtn').onclick = async () => {
+  const busy = state.jobs.filter(j => j.status === 'pending' || j.status === 'running').length;
+  if (!confirm(busy ? `Quit Pocket Recordings? ${busy} queued job(s) will pick up again the next time you open it.`
+                    : 'Quit Pocket Recordings?')) return;
+  audio.pause();
+  try { await api('/api/shutdown', { method: 'POST' }); } catch {}
+  document.body.innerHTML = '<div class="empty" style="padding-top:80px">Pocket Recordings has quit. Open it again from Launchpad or Spotlight.</div>';
+};
 async function loadVoices() { try { state.voices = (await api('/api/voices')).voices; } catch {} }
 
 (async () => {

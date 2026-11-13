@@ -396,6 +396,7 @@ class Queue:
         self.procs: dict[str, subprocess.Popen] = {}
         self.wake = threading.Event()
         self.caffeinate: subprocess.Popen | None = None
+        self.stopping = False
         self.save()
 
     def save(self):
@@ -482,11 +483,15 @@ class Queue:
                 continue
             try:
                 run_job(self, job)
+                if self.stopping:
+                    continue  # killed by shutdown: stays pending for next launch
                 if job.get("cancel"):
                     job.update(status="cancelled")
                 elif job["status"] == "running":
                     job["status"] = "done"
             except Exception as e:
+                if self.stopping:
+                    continue
                 job.update(status="cancelled" if job.get("cancel") else "failed",
                            error=str(e)[-500:])
             job["finished"] = time.time()
@@ -618,6 +623,30 @@ def move_job(job_id: str, body: dict = Body(...)):
 @app.post("/api/jobs/clear")
 def clear_jobs():
     queue.clear_finished()
+    return {"ok": True}
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    """Stop the server (the launcher app runs it with no window). A running
+    job is stopped and goes back to pending, so it restarts on next launch."""
+    def stop():
+        time.sleep(0.5)
+        with queue.lock:
+            queue.stopping = True
+            for job_id, p in list(queue.procs.items()):
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            for j in queue.jobs:
+                if j["status"] == "running":
+                    j.update(status="pending", progress="Stopped when the app quit")
+            queue.save()
+        if queue.caffeinate and queue.caffeinate.poll() is None:
+            queue.caffeinate.terminate()
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=stop, daemon=True).start()
     return {"ok": True}
 
 
