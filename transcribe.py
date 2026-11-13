@@ -438,7 +438,17 @@ def cmd_name(args) -> None:
         sys.exit(f"{label} not in {mp3.name}; it has: {', '.join(diar['speakers'])}")
     spk = diar["speakers"][label]
     if not spk.get("embedding"):
-        sys.exit(f"{label} has no usable voiceprint (too little speech).")
+        if not spk.get("manual"):
+            sys.exit(f"{label} has no usable voiceprint (too little speech).")
+        # A speaker created by moving lines: rename it, nothing to learn.
+        for other in diar["speakers"].values():
+            if other is not spk and other.get("name") == name:
+                other.update(name=None, score=None, pinned=False)
+        spk.update(name=name, score=None, pinned=True)
+        p["spk"].write_text(json.dumps(diar, indent=1))
+        render(mp3)
+        print(f"{label} in {mp3.stem} is now {name} (no voiceprint saved).")
+        return
 
     voices = load_voices()
     for other in diar["speakers"].values():  # a name belongs to one speaker per recording
@@ -464,6 +474,64 @@ def cmd_name(args) -> None:
     print("Run --rematch to relabel your other transcripts with this voice.")
 
 
+def parse_range(spec: str, n: int) -> list[int]:
+    """'5' or '5-9' (segment indexes, 0-based, inclusive) -> list of indexes."""
+    a, _, b = spec.partition("-")
+    lo, hi = int(a), int(b or a)
+    if not (0 <= lo <= hi < n):
+        sys.exit(f"Line range {spec} is outside 0-{n - 1}.")
+    return list(range(lo, hi + 1))
+
+
+def cmd_move(args) -> None:
+    """Reassign transcript lines to another speaker (by display name or label).
+    A name that isn't a speaker in this recording gets a new, manually named
+    speaker. Moves are kept by --rematch; re-transcribing with --force redoes them."""
+    ref, spec, person = args.move
+    person = person.strip()
+    if not person:
+        sys.exit("Give a speaker name.")
+    mp3 = find_recording(ref, args.dir)
+    p = paths(mp3)
+    if not p["spk"].exists():
+        sys.exit(f"No speaker data for {mp3.name}; transcribe it with speakers first.")
+    data = json.loads(p["json"].read_text())
+    diar = json.loads(p["spk"].read_text())
+    segs = data["segments"]
+    idx = parse_range(spec, len(segs))
+
+    spk = diar["speakers"]
+    target = next((lab for lab, s in spk.items()
+                   if (s.get("name") or lab).lower() == person.lower()), None)
+    if target is None:
+        target = next((lab for lab in spk if lab.lower() == person.lower()), None)
+    if target is None:  # a new speaker for this recording, named by hand
+        n = 0
+        while f"Speaker {chr(65 + n)}" in spk:
+            n += 1
+        target = f"Speaker {chr(65 + n)}"
+        spk[target] = {"seconds": 0.0, "embedding": None, "name": person,
+                       "score": None, "pinned": True, "manual": True}
+
+    moved = 0
+    for i in idx:
+        s = segs[i]
+        old = s.get("speaker")
+        if old == target:
+            continue
+        dur = max(s["end"] - s["start"], 0)
+        if old in spk:
+            spk[old]["seconds"] = round(max(spk[old]["seconds"] - dur, 0), 1)
+        spk[target]["seconds"] = round(spk[target]["seconds"] + dur, 1)
+        s["speaker"], s["moved"] = target, True
+        moved += 1
+
+    p["json"].write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    p["spk"].write_text(json.dumps(diar, indent=1))
+    render(mp3)
+    print(f"Moved {moved} line(s) in {mp3.stem} to {spk[target].get('name') or target}.")
+
+
 def cmd_forget(args) -> None:
     voices = load_voices()
     if voices.pop(args.forget, None) is None:
@@ -478,7 +546,7 @@ def cmd_rematch(args) -> None:
         mp3 = spk_file.with_name(spk_file.name.replace(".speakers.json", ".mp3"))
         diar = json.loads(spk_file.read_text())
         for s in diar["speakers"].values():  # drop pins on voices that were deleted
-            if s.get("pinned") and s.get("name") not in voices:
+            if s.get("pinned") and s.get("name") not in voices and not s.get("manual"):
                 s.update(name=None, pinned=False)
         diar = match(diar, voices, args.threshold)
         spk_file.write_text(json.dumps(diar, indent=1))
@@ -510,6 +578,8 @@ def main():
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--speakers", metavar="REC", help="show a recording's speakers and matches")
     g.add_argument("--name", nargs=3, metavar=("REC", "LABEL", "NAME"), help="name a speaker")
+    g.add_argument("--move", nargs=3, metavar=("REC", "LINES", "NAME"),
+                   help="reassign transcript lines (index or range like 12-15, from 0) to a speaker")
     g.add_argument("--forget", metavar="NAME", help="delete a saved voiceprint")
     g.add_argument("--rematch", action="store_true", help="relabel all transcripts")
     args = ap.parse_args()
@@ -518,6 +588,8 @@ def main():
         return cmd_speakers(args)
     if args.name:
         return cmd_name(args)
+    if args.move:
+        return cmd_move(args)
     if args.forget:
         return cmd_forget(args)
     if args.rematch:

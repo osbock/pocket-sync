@@ -301,6 +301,7 @@ uv run transcribe.py --summary-only FILE     summarize existing transcripts only
 
 uv run transcribe.py --speakers REC              speakers, clips and voice matches
 uv run transcribe.py --name REC "Speaker B" "Alex"   name a speaker (saves a voiceprint)
+uv run transcribe.py --move REC 12-15 "Alex"     move transcript lines (from 0) to another speaker
 uv run transcribe.py --rematch                   relabel all transcripts with current voices
 uv run transcribe.py --forget "Alex"             delete a voiceprint
       --threshold 0.70   voice match threshold
@@ -327,6 +328,13 @@ Calibration on this recorder:
 
 Voiceprints change only when you name someone. Automatic matches never
 update them, so one wrong match can't gradually corrupt a voice.
+
+**Fixing a misattributed line.** pyannote sometimes gives a short remark to
+the wrong person. In the app, hover a transcript line and click **⇄** to move
+it (or its whole turn) to another speaker, a known voice, or a new name. Moved
+lines are marked ✎ and survive rematching; voiceprints aren't changed.
+Re-transcribing with `--force` redoes the speaker labels, and moves are lost.
+Summaries aren't redone automatically; queue **Summarize again** if it matters.
 
 ---
 

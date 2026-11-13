@@ -37,7 +37,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
 HERE = Path(__file__).resolve().parent
-REC_DIR = Path.home() / "PocketRecordings"
+REC_DIR = Path(os.environ.get("POCKET_RECORDINGS") or Path.home() / "PocketRecordings")
 QUEUE_FILE = REC_DIR / ".queue.json"
 VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
 APP_CFG = Path.home() / ".config" / "pocket-sync" / "app.json"
@@ -92,7 +92,7 @@ def real_speakers(spk: dict | None) -> dict:
     if not spk:
         return {}
     return {lab: s for lab, s in spk.get("speakers", {}).items()
-            if s.get("seconds", 0) >= MIN_SPEAKER_SECONDS}
+            if s.get("seconds", 0) >= MIN_SPEAKER_SECONDS or (s.get("manual") and s["seconds"] > 0)}
 
 
 def app_cfg() -> dict:
@@ -179,7 +179,8 @@ def get_recording(date: str, name: str):
     spk = read_json(side(mp3, ".speakers.json"), None)
     names = display_names(spk)
     segs = [{"start": s["start"], "end": s["end"], "text": s["text"].strip(),
-             "speaker": names.get(s.get("speaker"), s.get("speaker"))}
+             "speaker": names.get(s.get("speaker"), s.get("speaker")),
+             "label": s.get("speaker"), "moved": bool(s.get("moved"))}
             for s in data.get("segments", [])]
     speakers = []
     if spk:
@@ -266,8 +267,20 @@ def name_speaker(date: str, name: str, body: dict = Body(...)):
     if not label or not person or len(person) > 80:
         raise HTTPException(400, "label and name required")
     run_cli(["transcribe.py", "--name", str(REC_DIR / f"{rec_id}.mp3"), label, person])
-    out = run_cli(["transcribe.py", "--rematch"])
+    out = run_cli(["transcribe.py", "--rematch", "--dir", str(REC_DIR)])
     return {"ok": True, "rematch": out.strip().splitlines()}
+
+
+@app.post("/api/recordings/{date}/{name}/move")
+def move_lines(date: str, name: str, body: dict = Body(...)):
+    """Reassign transcript lines (segment indexes, "5" or "5-9") to a speaker."""
+    rec_id = f"{date}/{name}"
+    mp3_for(rec_id)
+    lines, person = str(body.get("lines", "")), (body.get("name") or "").strip()
+    if not re.fullmatch(r"\d+(-\d+)?", lines) or not person or len(person) > 80:
+        raise HTTPException(400, "lines and name required")
+    out = run_cli(["transcribe.py", "--move", str(REC_DIR / f"{rec_id}.mp3"), lines, person])
+    return {"ok": True, "message": out.strip()}
 
 
 @app.get("/api/voices")
@@ -280,7 +293,7 @@ def voices():
 @app.delete("/api/voices/{person}")
 def forget_voice(person: str):
     run_cli(["transcribe.py", "--forget", person])
-    run_cli(["transcribe.py", "--rematch"])
+    run_cli(["transcribe.py", "--rematch", "--dir", str(REC_DIR)])
     return {"ok": True}
 
 
@@ -652,7 +665,9 @@ def shutdown():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (HERE / "static" / "index.html").read_text()
+    # no-store: always fetch the current page, so app updates show after a reload
+    return HTMLResponse((HERE / "static" / "index.html").read_text(),
+                        headers={"Cache-Control": "no-store"})
 
 
 def main():

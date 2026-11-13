@@ -77,6 +77,24 @@ canvas#wave { width: 100%; height: 64px; display: block; cursor: pointer; }
 .seg.now { background: var(--sel); }
 .seg .ts { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; padding-top: 1px; }
 .seg .who { font-weight: 600; margin-right: 4px; }
+.seg.mv-on { grid-template-columns: 58px 1fr 26px; }
+.seg .mvb { opacity: .35; padding: 0 5px; font-size: 12px; line-height: 18px; align-self: start; }
+.seg:hover .mvb, .seg.picked .mvb { opacity: 1; }
+.seg.mv-on .who { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.seg.mv-on .who:hover { color: var(--accent); }
+.seg.picked { outline: 2px solid var(--accent); outline-offset: -2px; }
+.seg .who.moved::after { content: " ✎"; font-weight: 400; color: var(--muted); }
+#mvMenu { position: fixed; z-index: 20; width: 250px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 10px 30px rgb(0 0 0 / .18); padding: 8px; display: none; }
+#mvMenu.open { display: block; }
+#mvMenu .t { font-weight: 600; margin: 2px 4px 6px; }
+#mvMenu .opt { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 4px 6px; border-radius: 6px; }
+#mvMenu .opt:hover { background: var(--sel); }
+#mvMenu .opt .note { margin-left: 4px; }
+#mvMenu .sep { border-top: 1px solid var(--line); margin: 6px 0; }
+#mvMenu label { display: flex; gap: 6px; align-items: center; font-size: 12.5px; margin: 2px 4px 6px; color: var(--muted); }
+#mvMenu .other { display: flex; gap: 6px; }
+#mvMenu .other input { flex: 1; min-width: 0; }
 .summary h1, .summary h2, .summary h3 { font-size: 15px; margin: 14px 0 4px; }
 .summary ul { padding-left: 20px; margin: 4px 0; }
 .spk { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--panel); }
@@ -165,6 +183,7 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
   <div class="btns"><button id="delCancel">Cancel</button><button id="delGo" class="primary" disabled>Delete</button></div>
 </dialog>
 <div id="toast"></div>
+<div id="mvMenu"></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -381,12 +400,21 @@ function renderTab() {
     if (!d.segments.length) { body.innerHTML = `<div class="cta"><span class="note">No transcript yet.</span><button id="ctaT">Transcribe</button></div>`;
       $('#ctaT').onclick = () => enqueue('transcribe', [d.id]); return; }
     let prev = null;
+    const canMove = d.speakers_done;
     body.innerHTML = d.segments.map((s, i) => {
-      const who = s.speaker && s.speaker !== prev ? `<span class="who">${esc(s.speaker)}:</span>` : '';
+      const who = s.speaker && (s.speaker !== prev || s.moved !== d.segments[i - 1]?.moved)
+        ? `<span class="who${s.moved ? ' moved' : ''}"${canMove ? ` data-mvwho="${i}"` : ''} title="${s.moved ? 'Moved by you. ' : ''}${canMove ? 'Click to move to another speaker' : ''}">${esc(s.speaker)}:</span>` : '';
       prev = s.speaker;
-      return `<div class="seg" data-i="${i}"><span class="ts">${fmt(s.start)}</span><span>${who}${esc(s.text)}</span></div>`;
+      return `<div class="seg${canMove ? ' mv-on' : ''}" data-i="${i}"><span class="ts">${fmt(s.start)}</span><span>${who}${esc(s.text)}</span>`
+        + (canMove ? `<button class="mvb" data-mv="${i}" title="Move this line to another speaker">⇄</button>` : '') + '</div>';
     }).join('');
-    body.onclick = e => { const s = e.target.closest('.seg'); if (s) seek(d.segments[+s.dataset.i].start); };
+    body.onclick = e => {
+      const m = e.target.closest('[data-mv]');
+      if (m) { e.stopPropagation(); openMove(+m.dataset.mv, m); return; }
+      const w = e.target.closest('[data-mvwho]');
+      if (w) { e.stopPropagation(); openMove(+w.dataset.mvwho, w); return; }
+      const s = e.target.closest('.seg'); if (s) seek(d.segments[+s.dataset.i].start);
+    };
   } else if (state.tab === 'summary') {
     body.innerHTML = d.summary ? `<div class="summary">${md(d.summary)}</div><div class="cta"><button id="ctaS">Summarize again</button></div>`
       : `<div class="cta"><span class="note">No summary yet.</span><button id="ctaS">Summarize</button></div>`;
@@ -418,6 +446,60 @@ function renderTab() {
     };
   }
 }
+// ── move lines to another speaker ───────────────────
+function turnOf(i) {  // the run of consecutive lines with the same speaker around line i
+  const segs = state.detail.segments, lab = segs[i].label;
+  let a = i, b = i;
+  while (a > 0 && segs[a - 1].label === lab) a--;
+  while (b < segs.length - 1 && segs[b + 1].label === lab) b++;
+  return [a, b];
+}
+function closeMove() {
+  $('#mvMenu').classList.remove('open');
+  document.querySelectorAll('.seg.picked').forEach(e => e.classList.remove('picked'));
+}
+function openMove(i, btn) {
+  const d = state.detail, seg = d.segments[i], [a, b] = turnOf(i), menu = $('#mvMenu');
+  const here = d.speaker_details.map(s => s.name || s.label);
+  const names = [...new Set([...here, ...state.voices.map(v => v.name)])].filter(n => n !== seg.speaker);
+  menu.innerHTML = `<div class="t">Move to…</div>
+    ${b > a ? `<label><input type="checkbox" id="mvTurn"> Whole turn: ${b - a + 1} lines, ${fmt(d.segments[a].start)}–${fmt(d.segments[b].end)}</label>` : ''}
+    ${names.map(n => `<button class="opt" data-to="${esc(n)}">${esc(n)}${here.includes(n) ? '' : '<span class="note">not in this recording yet</span>'}</button>`).join('')}
+    <div class="sep"></div>
+    <div class="other"><input type="text" id="mvOther" placeholder="Someone else…"><button id="mvGo">Move</button></div>`;
+  const mark = () => {
+    const [x, y] = $('#mvTurn')?.checked ? [a, b] : [i, i];
+    document.querySelectorAll('.seg.picked').forEach(e => e.classList.remove('picked'));
+    for (let k = x; k <= y; k++) document.querySelector(`.seg[data-i="${k}"]`)?.classList.add('picked');
+  };
+  mark();
+  if ($('#mvTurn')) $('#mvTurn').onchange = mark;
+  const go = async to => {
+    to = to.trim(); if (!to) return toast('Type a name first');
+    const lines = $('#mvTurn')?.checked ? `${a}-${b}` : `${i}`;
+    menu.querySelectorAll('button').forEach(x => x.disabled = true);
+    try {
+      await api(`/api/recordings/${d.id}/move`, { method: 'POST', body: { lines, name: to } });
+      closeMove();
+      const sc = $('#detail').scrollTop, fresh = await api(`/api/recordings/${d.id}`);
+      if (state.active !== d.id) return;
+      state.detail = fresh; renderDetail(); $('#detail').scrollTop = sc;
+      toast(`Moved to ${to}`); loadList();
+    } catch (err) { toast(err.message); menu.querySelectorAll('button').forEach(x => x.disabled = false); }
+  };
+  menu.onclick = e => { const o = e.target.closest('[data-to]'); if (o) go(o.dataset.to); };
+  $('#mvGo').onclick = () => go($('#mvOther').value);
+  $('#mvOther').onkeydown = e => { if (e.key === 'Enter') go(e.target.value); if (e.key === 'Escape') closeMove(); };
+  const r = btn.getBoundingClientRect();
+  menu.classList.add('open');
+  const h = menu.offsetHeight;
+  const x = btn.matches('[data-mvwho]') ? r.left : r.right - menu.offsetWidth;
+  menu.style.left = Math.max(8, Math.min(x, innerWidth - menu.offsetWidth - 8)) + 'px';
+  menu.style.top = (r.bottom + 4 + h > innerHeight ? Math.max(8, r.top - h - 4) : r.bottom + 4) + 'px';
+}
+document.addEventListener('mousedown', e => { if (!e.target.closest('#mvMenu, [data-mv], [data-mvwho]')) closeMove(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMove(); });
+
 function md(text) {  // small Markdown subset: headings, bold, italics, bullets
   const lines = text.split('\n'); let html = '', inList = false;
   const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|\W)_(.+?)_(\W|$)/g, '$1<i>$2</i>$3').replace(/\*(.+?)\*/g, '<i>$1</i>');
