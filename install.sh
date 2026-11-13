@@ -38,7 +38,16 @@ ok()   { echo "  ${G}✓${N} $*"; }
 warn() { echo "  ${Y}!${N} $*"; WARN=$((WARN + 1)); }
 bad()  { echo "  ${R}✗${N} $*"; FAIL=$((FAIL + 1)); }
 step() { echo; echo "${B}$*${N}"; }
-ask()  { [ "$MODE" = install ] || return 1; local a; read -r -p "    $1 [Y/n] " a </dev/tty; [[ ! "$a" =~ ^[Nn] ]]; }
+ask()  {
+  [ "$MODE" = install ] || return 1
+  # No terminal to answer in (e.g. run from an editor or agent shell): skip
+  # rather than treat the failed read as "yes".
+  if ! { : </dev/tty; } 2>/dev/null; then
+    echo "    $1 Skipped: no terminal to answer in; run ./install.sh from Terminal."
+    return 1
+  fi
+  local a; read -r -p "    $1 [Y/n] " a </dev/tty; [[ ! "$a" =~ ^[Nn] ]]
+}
 WARN=0; FAIL=0
 
 # --- export -----------------------------------------------------------------
