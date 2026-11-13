@@ -41,6 +41,31 @@ Suggested structure: a small `platform_support.py` holding decode, find/eject
 drive, keep-awake, spawn/kill job, trash; plus a Whisper backend switch in
 `transcribe.py`.
 
+## Models: copy from the Mac instead of re-downloading
+
+Worked out 2026-11-13 from what is on the Mac:
+
+| On the Mac (`~/.lmstudio/models/`) | Size | On the PC |
+|---|---|---|
+| `HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/` (GGUF Q4_K_M) | 21 GB | **Copy it.** GGUF is cross-platform. |
+| `lmstudio-community/Qwen3.8-27B-MLX-4bit/` | 15 GB | Useless (MLX is Apple-only). Get a GGUF build if wanted. |
+| `mlx-community/whisper-large-v3-turbo/` | 1.5 GB | Useless. faster-whisper needs the CTranslate2 build (~1.6 GB download either way). |
+
+- Copy the folder to `%USERPROFILE%\.lmstudio\models\HauhauCS\` keeping the
+  publisher\model layout, and LM Studio lists it under My Models. The
+  `mmproj-…f16.gguf` file (0.9 GB) is only for images; summaries don't need it.
+- Transfer: SMB share (macOS File Sharing with Windows File Sharing on, or a
+  Windows share opened from Finder with `smb://`), ~6–12 min over Wi-Fi; or a
+  USB SSD formatted **exFAT** (FAT32 can't hold files over 4 GB).
+- pyannote's model is in `~/.cache/huggingface/hub`; copying it to
+  `%USERPROFILE%\.cache\huggingface\hub` avoids that download too (the HF
+  login is still needed).
+- The 35B model needs ~24 GB VRAM to run fully on the GPU. On an 8–12 GB card
+  it partly runs on the CPU and summaries get much slower; an ~8B model is a
+  better fit there.
+- On the Mac, LM Studio and llama.cpp were within ~10% on this model (LM Studio
+  faster), so there's no speed reason to prefer llama.cpp on the PC either.
+
 ## Gotchas
 
 - **PyTorch from PyPI on Windows is CPU-only.** Add a `[tool.uv.sources]` /
