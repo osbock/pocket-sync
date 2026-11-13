@@ -249,7 +249,7 @@ function renderList() {
       ...q.map(k => `<span class="b queued">${k === 'delete_device' ? 'deleting' : k + ' queued'}</span>`),
     ].join('');
     html += `<div class="row ${state.active === r.id ? 'active' : ''}" data-id="${esc(r.id)}">
-      <input type="checkbox" ${state.selected.has(r.id) ? 'checked' : ''} data-sel="${esc(r.id)}" ${r.on_mac ? '' : 'disabled'}>
+      <input type="checkbox" ${state.selected.has(r.id) ? 'checked' : ''} data-sel="${esc(r.id)}" ${selectable(r) ? '' : 'disabled'}>
       <div><div class="t ${r.title ? '' : 'untitled'}">${esc(r.title || w.time)}</div>
         <div class="sub">${r.title ? esc(w.time) + ' · ' : ''}${esc(r.speakers.join(', ') || (r.transcribed ? '' : ''))}</div>
         <div class="badges">${badges}</div></div>
@@ -263,15 +263,17 @@ $('#list').addEventListener('click', e => {
   if (cb) { cb.checked ? state.selected.add(cb.dataset.sel) : state.selected.delete(cb.dataset.sel); updateActions(); return; }
   const row = e.target.closest('.row'); if (row) openRec(row.dataset.id);
 });
+// Recorder-only rows can be selected too, so they can be deleted from the recorder
+// (transcribe and summarize skip them on the server).
+function selectable(r) { return r.on_mac || r.on_device; }
 function updateActions() {
   const n = state.selected.size;
   $('#selCount').textContent = `${n} selected`;
   for (const b of ['#actTranscribe', '#actSummarize', '#actDelete']) $(b).disabled = n === 0;
-  const selectable = state.recs.filter(r => r.on_mac);
-  $('#selAll').checked = n > 0 && n === selectable.length;
+  $('#selAll').checked = n > 0 && n === state.recs.filter(selectable).length;
 }
 $('#selAll').addEventListener('change', e => {
-  state.selected = new Set(e.target.checked ? state.recs.filter(r => r.on_mac).map(r => r.id) : []);
+  state.selected = new Set(e.target.checked ? state.recs.filter(selectable).map(r => r.id) : []);
   renderList();
 });
 let searchT; $('#search').addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(loadList, 250); });
@@ -365,7 +367,9 @@ async function openRec(id) {
   state.active = id; renderList();
   if (r && !r.on_mac) {
     audio.pause();
-    $('#detail').innerHTML = `<div class="empty">This recording is only on the recorder. Sync to download it.</div>`;
+    $('#detail').innerHTML = `<div class="empty">This recording is only on the recorder.${r.deleted_locally ? ' It was deleted on the Mac, so Sync won’t download it again.' : ' Sync to download it.'}
+      <p><button class="danger" id="delOne">Delete from recorder…</button></p></div>`;
+    $('#delOne').onclick = () => openDelete([id]);
     return;
   }
   const d = await api(`/api/recordings/${id}`);
