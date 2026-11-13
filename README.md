@@ -9,7 +9,7 @@ any other cloud service.
 |---|---|
 | `app.py` | Local web app: browse, play, title, delete, name speakers, queue transcription and summaries |
 | `pocket_sync.py` | Talks to the recorder: download (Bluetooth or USB), list, delete, device info |
-| `transcribe.py` | Transcription (Whisper), speaker labelling (pyannote), summaries and titles (LM Studio) |
+| `transcribe.py` | Transcription (Whisper), speaker labelling (pyannote), summaries and titles (LM Studio, Ollama or llama.cpp) |
 | `static/index.html` | The web app's page |
 | `make_app.sh` | Builds `Pocket Recordings.app` so the web app opens from Launchpad, Spotlight or the Dock |
 | `install.sh` | Checks or sets up everything below on a Mac; exports and imports settings between Macs |
@@ -100,12 +100,28 @@ ffmpeg isn't needed.
 The login is only needed to download the model once. Audio never leaves the Mac.
 Skip speaker labelling with `--no-speakers` if you don't want this.
 
-### 5. LM Studio (summaries and titles)
+### 5. An LLM server (summaries and titles)
 
-Start LM Studio's local server (port 1234). Any loaded chat model works; the
-web app loads the one you pick and unloads other LLMs to make room.
+Summaries and titles come from a local LLM server. LM Studio is the default;
+Ollama, llama.cpp's `llama-server` and other servers with an OpenAI-compatible
+API work too. Choose one with **Server…** next to the model menu in the app,
+`--llm-url` on the command line, or `"llm_url"` in
+`~/.config/pocket-sync/app.json`. The kind of server is detected automatically
+(`llm.py`).
+
+| Server | URL | Notes |
+|---|---|---|
+| LM Studio | `http://localhost:1234` (default) | Start the server in the Developer tab. The web app loads the model you pick (32k context) and unloads other LLMs to make room. |
+| Ollama | `http://localhost:11434` | Pull a model with `ollama pull`; it loads on first use. Requests set a 32k context, since Ollama's default would cut long transcripts. |
+| llama.cpp | `http://localhost:8080` | One model per server: `llama-server -m MODEL.gguf -c 32768 --jinja`. |
+
+llama.cpp can serve the GGUF models LM Studio has already downloaded (in
+`~/.lmstudio/models/`), so nothing has to be downloaded twice. MLX models only
+work in LM Studio.
+
 Summaries are requested with reasoning turned off, which is much faster and
-gives similar results.
+gives similar results. Point it only at a server on this Mac, or transcripts
+leave it.
 
 Measured on an M4 Pro (48 GB), 25-minute recording:
 
@@ -137,6 +153,7 @@ Measured on an M4 Pro (48 GB), 25-minute recording:
 4. **LM Studio** from [lmstudio.ai](https://lmstudio.ai): download a chat model
    and `mlx-community/whisper-large-v3-turbo`, start the server (Developer tab)
    and turn on starting it at login. `install.sh` can download Whisper instead.
+   Ollama or llama.cpp also work for summaries (see step 5 of setup).
 5. **Carry your settings over** (optional but saves re-reading the session key
    and re-naming voices). On this Mac:
    ```bash
@@ -291,7 +308,8 @@ uv run transcribe.py --largest               just the longest untranscribed one
 uv run transcribe.py FILE.mp3 ...            specific files (add --force to redo)
 uv run transcribe.py --summarize             also summarize and suggest a title
 uv run transcribe.py --summary-only FILE     summarize existing transcripts only
-      --model ID        LM Studio model for summaries (default: the loaded one)
+      --model ID        model for summaries (default: the loaded one)
+      --llm-url URL     LLM server (default: llm_url in app.json, else LM Studio)
       --think           let the model reason first (much slower)
       --no-title        don't suggest a title
       --no-speakers     skip speaker labelling
@@ -385,7 +403,7 @@ follows are in `.claude/skills/pocket-inbox/SKILL.md`.
 ~/.config/pocket-sync/
   config.json     session key and recorder address (mode 600)
   voices.json     named voiceprints (mode 600)
-  app.json        app settings (summary model)
+  app.json        app settings (summary model, LLM server URL)
 ```
 
 Recording names are the UTC start time (`YYYYMMDDHHmmss`). A second form,
@@ -406,6 +424,7 @@ local times.
 | Recorder shows 0 GB / 0 recordings | USB mode is on with the cable in. Eject, `usb off`, unplug. |
 | `Could not load pyannote/...` | Accept the model terms and run `hf auth login` (see setup). |
 | Summary: `No LLM is loaded` | Load a model in LM Studio, or pass `--model`. |
+| Summary: `No LLM server at …` | Start the server, or set its URL with **Server…** in the app or `--llm-url`. |
 | Short clips you didn't record | Plugging in the cable or pressing the button seems to start a short recording. They're harmless and hidden in the app. |
 
 ---

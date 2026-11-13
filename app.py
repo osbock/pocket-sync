@@ -28,7 +28,6 @@ import subprocess
 import threading
 import tomllib
 import time
-import urllib.request
 import uuid
 from pathlib import Path
 
@@ -37,6 +36,8 @@ import uvicorn
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
+import llm
+
 HERE = Path(__file__).resolve().parent
 REC_DIR = Path(os.environ.get("POCKET_RECORDINGS") or Path.home() / "PocketRecordings")
 QUEUE_FILE = REC_DIR / ".queue.json"
@@ -44,7 +45,6 @@ VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
 APP_CFG = Path.home() / ".config" / "pocket-sync" / "app.json"
 PROJECTS = Path.home() / ".config" / "pocket-sync" / "projects.toml"
 LMS = Path.home() / ".lmstudio" / "bin" / "lms"
-LMSTUDIO = "http://localhost:1234"
 UV = shutil.which("uv") or "/opt/homebrew/bin/uv"
 BYTES_PER_SECOND = 4000
 SHORT_SECONDS = 3
@@ -348,27 +348,28 @@ def delete(body: dict = Body(...)):
     return {"trashed": trashed, "audio_removed": audio_removed, "skipped": skipped, "job": job}
 
 
-# ── LM Studio ──────────────────────────────────────────────────────
+# ── LLM server ─────────────────────────────────────────────────────
 
 def lm_models() -> list[dict]:
-    with urllib.request.urlopen(f"{LMSTUDIO}/api/v0/models", timeout=5) as r:
-        data = json.load(r)["data"]
-    return [{"id": m["id"], "state": m.get("state"), "arch": m.get("arch")}
-            for m in data if m.get("type") in ("llm", "vlm")]
+    return llm.models(llm.server_url())
 
 
 @app.get("/api/models")
 def models():
+    url = llm.server_url()
+    server = {"url": url, "kind": None, "name": None}
     try:
         ms = lm_models()
+        server.update(kind=llm.kind(url), name=llm.NAMES[llm.kind(url)])
     except Exception as e:
-        return {"models": [], "error": f"LM Studio not reachable: {e}", "default": None}
+        return {"models": [], "error": f"No LLM server at {url}: {e}", "default": None,
+                "server": server}
     ids = [m["id"] for m in ms]
     default = app_cfg().get("summary_model")
     if default not in ids:
         default = next((i for i in ids if "a3b" in i.lower()), None) or \
             next((m["id"] for m in ms if m["state"] == "loaded"), ids[0] if ids else None)
-    return {"models": ms, "default": default}
+    return {"models": ms, "default": default, "server": server}
 
 
 @app.put("/api/settings")
@@ -376,12 +377,24 @@ def settings(body: dict = Body(...)):
     cfg = app_cfg()
     if "summary_model" in body:
         cfg["summary_model"] = body["summary_model"]
+    if "llm_url" in body:
+        url = (body["llm_url"] or "").strip()
+        if url and not re.match(r"^(https?://)?[\w.\-\[\]:]+(:\d+)?(/.*)?$", url):
+            raise HTTPException(400, "llm_url must look like http://localhost:11434")
+        if url:
+            cfg["llm_url"] = llm.server_url(url)
+        else:
+            cfg.pop("llm_url", None)
     write_json(APP_CFG, cfg)
     return cfg
 
 
 def ensure_model_loaded(model: str, job: dict) -> None:
-    """Load the summary model in LM Studio, unloading other LLMs to make room."""
+    """On LM Studio, load the summary model, unloading other LLMs to make
+    room. Ollama and llama.cpp load (or already have) models themselves."""
+    url = llm.server_url()
+    if llm.kind(url) != "lmstudio" or not LMS.exists():
+        return
     ms = lm_models()
     if any(m["id"] == model and m["state"] == "loaded" for m in ms):
         return
@@ -390,7 +403,7 @@ def ensure_model_loaded(model: str, job: dict) -> None:
             job["progress"] = f"Unloading {m['id']} in LM Studio"
             subprocess.run([str(LMS), "unload", m["id"]], capture_output=True, timeout=120)
     job["progress"] = f"Loading {model} in LM Studio"
-    r = subprocess.run([str(LMS), "load", model, "--context-length", "32768", "-y"],
+    r = subprocess.run([str(LMS), "load", model, "--context-length", str(llm.CONTEXT), "-y"],
                        capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         raise RuntimeError(f"Could not load {model}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -777,7 +790,7 @@ def run_inbox(q: Queue, job: dict) -> None:
         if to_sum:
             model = opts.get("model") or models().get("default")
             if not model:
-                note("No LM Studio model available; skipping summaries")
+                note("No LLM server model available; skipping summaries")
             else:
                 note(f"Summarizing {len(to_sum)} recording(s) with {model}")
                 added, existing = queue_recs("summarize", to_sum, {"model": model})

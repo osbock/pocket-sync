@@ -158,6 +158,7 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
       <span class="count" id="selCount">0 selected</span>
       <button id="actTranscribe" disabled>Transcribe</button>
       <select id="modelSel" title="Summary model"></select>
+      <button id="llmBtn" class="link" title="Choose the LLM server for summaries">Server…</button>
       <button id="actSummarize" disabled>Summarize</button>
       <button id="actDelete" class="danger" disabled>Delete…</button>
     </div>
@@ -181,6 +182,14 @@ dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 1
   <label><input type="checkbox" id="delDev"> <span><b>On the recorder</b><br>
     <span class="note" id="delDevNote">Deleted over Bluetooth by a queued job. This can't be undone.</span></span></label>
   <div class="btns"><button id="delCancel">Cancel</button><button id="delGo" class="primary" disabled>Delete</button></div>
+</dialog>
+<dialog id="llmDlg">
+  <h3>LLM server for summaries</h3>
+  <p class="note">LM Studio <code>http://localhost:1234</code>, Ollama <code>http://localhost:11434</code>,
+    llama.cpp <code>http://localhost:8080</code>, or any OpenAI-compatible server. Leave empty for LM Studio.</p>
+  <input id="llmUrl" type="text" placeholder="http://localhost:1234" style="width: 100%">
+  <p class="note" id="llmStatus"></p>
+  <div class="btns"><button id="llmCancel">Cancel</button><button id="llmSave" class="primary">Save</button></div>
 </dialog>
 <div id="toast"></div>
 <div id="mvMenu"></div>
@@ -281,13 +290,31 @@ $('#actSummarize').onclick = () => enqueue('summarize', [...state.selected], { m
 $('#syncBtn').onclick = () => enqueue($('#syncHow').value, []);
 $('#modelSel').onchange = () => api('/api/settings', { method: 'PUT', body: { summary_model: $('#modelSel').value } });
 
+let llmServer = {};
 async function loadModels() {
   try {
     const d = await api('/api/models');
-    $('#modelSel').innerHTML = d.models.map(m => `<option value="${esc(m.id)}" ${m.id === d.default ? 'selected' : ''}>${esc(m.id)}${m.state === 'loaded' ? ' (loaded)' : ''}</option>`).join('')
-      || '<option value="">LM Studio not running</option>';
-  } catch { $('#modelSel').innerHTML = '<option value="">LM Studio not running</option>'; }
+    llmServer = d.server || {};
+    $('#modelSel').innerHTML = d.models.map(m => `<option value="${esc(m.id)}" ${m.id === d.default ? 'selected' : ''}>${esc(m.id.startsWith('/') ? m.id.split('/').pop().replace(/\.gguf$/, '') : m.id)}${m.state === 'loaded' ? ' (loaded)' : ''}</option>`).join('')
+      || `<option value="">${d.error ? 'LLM server not running' : 'No models on the server'}</option>`;
+    $('#modelSel').title = d.error || `Summary model (${llmServer.name} at ${llmServer.url})`;
+    return d;
+  } catch { $('#modelSel').innerHTML = '<option value="">LLM server not running</option>'; }
 }
+$('#llmBtn').onclick = () => {
+  $('#llmUrl').value = llmServer.url || '';
+  $('#llmStatus').textContent = llmServer.name ? `Connected: ${llmServer.name}` : 'Not connected';
+  $('#llmDlg').showModal();
+};
+$('#llmCancel').onclick = () => $('#llmDlg').close();
+$('#llmSave').onclick = async () => {
+  try {
+    await api('/api/settings', { method: 'PUT', body: { llm_url: $('#llmUrl').value } });
+    const d = await loadModels();
+    if (d && !d.error) { $('#llmDlg').close(); toast(`Using ${d.server.name}: ${d.models.length} model(s)`); }
+    else $('#llmStatus').textContent = d ? d.error : 'Could not reach the server';
+  } catch (e) { $('#llmStatus').textContent = e.message; }
+};
 
 // delete dialog
 let delIds = [];

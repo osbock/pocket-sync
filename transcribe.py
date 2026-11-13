@@ -8,8 +8,8 @@ Speech-to-text: the MLX Whisper model in LM Studio's model folder.
 Speakers: pyannote speaker-diarization-community-1 (Hugging Face login and
 accepted model terms needed once, for the download). Voiceprints of people
 you name are kept in ~/.config/pocket-sync/voices.json and recognized in
-later recordings. Summaries: the LLM loaded in LM Studio. Nothing leaves
-this Mac.
+later recordings. Summaries: a local LLM server (LM Studio, Ollama or
+llama.cpp; see llm.py). Nothing leaves this Mac.
 
     uv run transcribe.py                       # every recording without a transcript
     uv run transcribe.py --largest             # just the longest untranscribed one
@@ -31,16 +31,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 import wave
 from pathlib import Path
 
 import numpy as np
+
+import llm
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
@@ -48,7 +48,6 @@ REC_DIR = Path.home() / "PocketRecordings"
 WHISPER = Path.home() / ".lmstudio/models/mlx-community/whisper-large-v3-turbo"
 DIARIZER = "pyannote/speaker-diarization-community-1"
 VOICES = Path.home() / ".config" / "pocket-sync" / "voices.json"
-LMSTUDIO = "http://localhost:1234/v1"
 SR = 16000
 
 # Cosine similarity between a speaker's voiceprint and a named voice needed to
@@ -256,17 +255,17 @@ def render(mp3: Path) -> Path:
 
 # ── summary ─────────────────────────────────────────────────────────
 
-def lmstudio_model() -> str:
-    with urllib.request.urlopen("http://localhost:1234/api/v0/models", timeout=5) as r:
-        models = json.load(r)["data"]
-    loaded = [m["id"] for m in models
-              if m.get("state") == "loaded" and m.get("type") in ("llm", "vlm")]
-    if not loaded:
-        sys.exit("No LLM is loaded in LM Studio; load one or pass --model.")
-    return loaded[0]
+def default_model(url: str) -> str:
+    try:
+        model = llm.default_model(url)
+    except OSError as e:
+        sys.exit(f"No LLM server at {url} ({e}); start it or pass --llm-url.")
+    if not model:
+        sys.exit(f"No LLM is loaded in {llm.NAMES[llm.kind(url)]} at {url}; load one or pass --model.")
+    return model
 
 
-def summarize(txt: Path, model: str, think: bool = False) -> Path:
+def summarize(txt: Path, url: str, model: str, think: bool = False) -> Path:
     transcript = txt.read_text()
     prompt = (
         "Below is a transcript of a voice recording made with a pocket recorder. "
@@ -279,32 +278,12 @@ def summarize(txt: Path, model: str, think: bool = False) -> Path:
         "that were not said.\n\n"
         f"Transcript:\n{transcript}"
     )
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        # Reasoning made a 25-min summary take 8.5 min on a 27B model; a
-        # summary doesn't need it. Use --think to turn it back on.
-        **({} if think else {"reasoning_effort": "none"}),
-    }).encode()
-    req = urllib.request.Request(f"{LMSTUDIO}/chat/completions", body,
-                                 {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        text = json.load(r)["choices"][0]["message"]["content"]
-    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
+    # Reasoning made a 25-min summary take 8.5 min on a 27B model; a
+    # summary doesn't need it. Use --think to turn it back on.
+    text = llm.chat(url, model, prompt, think)
     out = txt.with_suffix(".summary.md")
-    out.write_text(f"# {txt.stem}\n\n_Summarized locally with {model}_\n\n{text}\n")
+    out.write_text(f"# {txt.stem}\n\n_Summarized locally with {llm.short(model)}_\n\n{text}\n")
     return out
-
-
-def chat(model: str, prompt: str, timeout: int = 300) -> str:
-    body = json.dumps({"model": model, "temperature": 0.3, "reasoning_effort": "none",
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(f"{LMSTUDIO}/chat/completions", body,
-                                 {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = json.load(r)["choices"][0]["message"]["content"]
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
 
 
 def meta_path(mp3: Path) -> Path:
@@ -322,14 +301,14 @@ def save_meta(mp3: Path, meta: dict) -> None:
     meta_path(mp3).write_text(json.dumps(meta, indent=1, ensure_ascii=False))
 
 
-def suggest_title(mp3: Path, summary: Path, model: str) -> str | None:
+def suggest_title(mp3: Path, summary: Path, url: str, model: str) -> str | None:
     """Give the recording an LLM title unless the user has set one."""
     meta = load_meta(mp3)
     if meta.get("title_source") == "user":
         return None
-    title = chat(model, "Give a short, specific title (at most 8 words) for the "
-                        "recording summarized below. Reply with the title only, no quotes.\n\n"
-                 + summary.read_text())
+    title = llm.chat(url, model, "Give a short, specific title (at most 8 words) for the "
+                     "recording summarized below. Reply with the title only, no quotes.\n\n"
+                     + summary.read_text(), timeout=300)
     title = title.splitlines()[0].strip().strip('"*#').strip()[:100] if title else ""
     if title:
         meta.update(title=title, title_source="llm")
@@ -397,11 +376,11 @@ def summarize_step(mp3: Path, txt: Path, args, model: str | None) -> None:
     if not model:
         return
     t0 = time.monotonic()
-    print(f"    summarizing with {model}...", end="", flush=True)
-    out = summarize(txt, model, args.think)
+    print(f"    summarizing with {llm.short(model)}...", end="", flush=True)
+    out = summarize(txt, args.llm_url, model, args.think)
     print(f" {time.monotonic() - t0:.0f}s -> {out.name}", flush=True)
     if not args.no_title:
-        title = suggest_title(mp3, out, model)
+        title = suggest_title(mp3, out, args.llm_url, model)
         if title:
             print(f"    title: {title}", flush=True)
 
@@ -569,12 +548,14 @@ def main():
     ap.add_argument("--num-speakers", type=int, help="exact speaker count, if known")
     ap.add_argument("--threshold", type=float, default=MATCH_THRESHOLD,
                     help=f"voice match threshold (default {MATCH_THRESHOLD})")
-    ap.add_argument("--summarize", action="store_true", help="summarize with LM Studio's LLM")
+    ap.add_argument("--summarize", action="store_true", help="summarize with the local LLM server")
     ap.add_argument("--think", action="store_true", help="let the LLM reason first (much slower)")
     ap.add_argument("--summary-only", action="store_true",
                     help="summarize existing transcripts without re-transcribing")
     ap.add_argument("--no-title", action="store_true", help="don't suggest a title")
-    ap.add_argument("--model", help="LM Studio model id for summaries (default: the loaded one)")
+    ap.add_argument("--model", help="model id for summaries (default: the loaded one)")
+    ap.add_argument("--llm-url", help="LLM server, e.g. http://localhost:11434 for Ollama "
+                    f"(default: llm_url in app.json, else {llm.DEFAULT_URL})")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--speakers", metavar="REC", help="show a recording's speakers and matches")
     g.add_argument("--name", nargs=3, metavar=("REC", "LABEL", "NAME"), help="name a speaker")
@@ -616,7 +597,8 @@ def main():
     needs_audio = not args.summary_only or any(not f.with_suffix(".txt").exists() for f in files)
     if needs_audio and not args.no_speakers:
         diarizer()  # fail early on a missing Hugging Face login
-    model = (args.model or lmstudio_model()) if args.summarize else None
+    args.llm_url = llm.server_url(args.llm_url)
+    model = (args.model or default_model(args.llm_url)) if args.summarize else None
     for i, mp3 in enumerate(files, 1):
         print(f"[{i}/{len(files)}] ", end="")
         process(mp3, args, voices, model)

@@ -18,6 +18,7 @@ Don't fork. The Mac must keep working exactly as it does now.
 - Web app (FastAPI, `static/index.html`, queue logic, estimates).
 - LM Studio: same server on localhost:1234. Only the `lms` path changes
   (`%USERPROFILE%\.lmstudio\bin\lms.exe`); models are GGUF instead of MLX.
+  Ollama and llama.cpp also work (`llm.py`, `llm_url` in app.json).
 - pyannote speaker recognition: change device selection from `mps` to
   `cuda` when available, CPU otherwise (`transcribe.py` ~line 115).
 - Session key: adb works on Windows (`winget install Google.PlatformTools`).

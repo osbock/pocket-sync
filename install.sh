@@ -155,7 +155,13 @@ if [ -d "/Applications/LM Studio.app" ] || [ -x "$LMS" ]; then
     echo "    transcripts but no summaries or titles."
   fi
 else
-  warn "LM Studio isn't installed (needed for summaries and titles): https://lmstudio.ai"
+  LLM_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("llm_url",""))' "$CONF/app.json" 2>/dev/null)
+  if [ -n "$LLM_URL" ] && curl -s -m 2 "$LLM_URL/v1/models" >/dev/null; then
+    ok "Using the LLM server at $LLM_URL"
+  else
+    warn "LM Studio isn't installed (needed for summaries and titles): https://lmstudio.ai"
+    echo "    Ollama or llama.cpp work too; see README, setup step 5."
+  fi
 fi
 
 step "Whisper model (transcription)"
